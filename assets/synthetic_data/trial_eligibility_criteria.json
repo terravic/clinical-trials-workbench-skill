@@ -1,0 +1,155 @@
+[
+  {
+    "study_id": "NCT-SYN-0101",
+    "protocol_code": "ONCO-301",
+    "min_age": 18,
+    "max_age": 85,
+    "allowed_icd10_prefixes": [
+      "C34"
+    ],
+    "max_ecog": 1,
+    "max_prior_lines": 2,
+    "min_washout_days": 21,
+    "biomarker_rule": {
+      "description": "EGFR activating mutation POSITIVE or PD-L1 TPS >= 50%",
+      "type": "OR",
+      "clauses": [
+        {
+          "field": "egfr_mutation",
+          "op": "==",
+          "value": "POSITIVE"
+        },
+        {
+          "field": "pdl1_tps_pct",
+          "op": ">=",
+          "value": 50.0
+        }
+      ]
+    },
+    "lab_thresholds": {
+      "min_egfr": 50.0,
+      "min_anc": 1.5,
+      "min_hb": 9.5,
+      "min_platelets": 100.0,
+      "max_bilirubin": 1.5,
+      "max_hba1c": 9.0
+    },
+    "exclusion_conditions": [
+      "ACTIVE_CNS_METS",
+      "INTERSTITIAL_LUNG_DISEASE",
+      "SEVERE_HEPATIC_IMPAIRMENT",
+      "RECENT_MAJOR_SURGERY"
+    ]
+  },
+  {
+    "study_id": "NCT-SYN-0204",
+    "protocol_code": "CARDIO-204",
+    "min_age": 35,
+    "max_age": 85,
+    "allowed_icd10_prefixes": [
+      "I50"
+    ],
+    "max_ecog": 2,
+    "max_prior_lines": 3,
+    "min_washout_days": 14,
+    "biomarker_rule": {
+      "description": "Left Ventricular Ejection Fraction (LVEF) <= 45%",
+      "type": "ALL",
+      "clauses": [
+        {
+          "field": "lvef_pct",
+          "op": "<=",
+          "value": 45.0
+        }
+      ]
+    },
+    "lab_thresholds": {
+      "min_egfr": 35.0,
+      "min_anc": 1.2,
+      "min_hb": 9.0,
+      "min_platelets": 90.0,
+      "max_bilirubin": 2.0,
+      "max_hba1c": 9.5
+    },
+    "exclusion_conditions": [
+      "UNCONTROLLED_ARRHYTHMIA",
+      "RECENT_MAJOR_SURGERY",
+      "SEVERE_HEPATIC_IMPAIRMENT"
+    ]
+  },
+  {
+    "study_id": "NCT-SYN-0309",
+    "protocol_code": "NEURO-309",
+    "min_age": 50,
+    "max_age": 84,
+    "allowed_icd10_prefixes": [
+      "G30",
+      "G31"
+    ],
+    "max_ecog": 1,
+    "max_prior_lines": 1,
+    "min_washout_days": 28,
+    "biomarker_rule": {
+      "description": "CSF phosphorylated tau-217 (pTau) >= 28.0 pg/mL",
+      "type": "ALL",
+      "clauses": [
+        {
+          "field": "csf_ptau_pg_ml",
+          "op": ">=",
+          "value": 28.0
+        }
+      ]
+    },
+    "lab_thresholds": {
+      "min_egfr": 45.0,
+      "min_anc": 1.5,
+      "min_hb": 10.0,
+      "min_platelets": 110.0,
+      "max_bilirubin": 1.6,
+      "max_hba1c": 8.5
+    },
+    "exclusion_conditions": [
+      "UNCONTROLLED_ARRHYTHMIA",
+      "RECENT_STROKE_TIA",
+      "SEVERE_HEPATIC_IMPAIRMENT"
+    ]
+  },
+  {
+    "study_id": "NCT-SYN-0412",
+    "protocol_code": "IMMUNO-412",
+    "min_age": 18,
+    "max_age": 78,
+    "allowed_icd10_prefixes": [
+      "K50",
+      "K51"
+    ],
+    "max_ecog": 1,
+    "max_prior_lines": 3,
+    "min_washout_days": 14,
+    "biomarker_rule": {
+      "description": "Fecal Calprotectin >= 250.0 ug/g",
+      "type": "ALL",
+      "clauses": [
+        {
+          "field": "fecal_calprotectin_ug_g",
+          "op": ">=",
+          "value": 250.0
+        }
+      ]
+    },
+    "lab_thresholds": {
+      "min_egfr": 50.0,
+      "min_anc": 1.5,
+      "min_hb": 9.0,
+      "min_platelets": 100.0,
+      "max_bilirubin": 1.5,
+      "max_hba1c": 8.5
+    },
+    "exclusion_conditions": [
+      "ACTIVE_TUBERCULOSIS",
+      "OPPORTUNISTIC_INFECTION",
+      "RECENT_MAJOR_SURGERY",
+      "SEVERE_HEPATIC_IMPAIRMENT"
+    ]
+  }
+]

@@ -1,0 +1,17 @@
+site_id,study_id,site_name,country_code,region,assigned_cra_id,peer_cra_id,site_status,target_enrollment,enrolled_count,screened_count,screen_fail_count,last_monitoring_date,days_since_monitoring,days_since_last_screen
+SITE-101,NCT-SYN-0101,Northeast Thoracic Research Center,US,NA,CRA-01,CRA-02,ACTIVE,30,19,36,17,2026-10-05,44,12
+SITE-102,NCT-SYN-0101,Pacific Coast Oncology Institute,US,NA,CRA-01,CRA-04,ACTIVE,30,10,28,18,2026-09-11,68,35
+SITE-103,NCT-SYN-0101,Rhein-Main University Clinical Center,DE,EMEA,CRA-02,CRA-01,ACTIVE,30,21,34,13,2026-10-20,29,9
+SITE-104,NCT-SYN-0101,Kansai Precision Pulmonary Hospital,JP,APAC,CRA-03,CRA-02,ACTIVE,30,24,33,9,2026-10-28,21,6
+SITE-105,NCT-SYN-0204,Great Lakes Heart and Vascular Unit,US,NA,CRA-01,CRA-03,ACTIVE,25,14,26,12,2026-10-12,37,15
+SITE-106,NCT-SYN-0204,Ontario Cardiorenal Academic Site,CA,NA,CRA-04,CRA-01,ACTIVE,25,8,22,14,2026-09-15,64,34
+SITE-107,NCT-SYN-0204,Midlands Cardiovascular Clinical Unit,UK,EMEA,CRA-02,CRA-04,ACTIVE,25,16,29,13,2026-10-18,31,11
+SITE-108,NCT-SYN-0204,Southern Cross Heart Institute,AU,APAC,CRA-03,CRA-04,ACTIVE,25,20,27,7,2026-10-30,19,8
+SITE-109,NCT-SYN-0309,Atlantic Memory and Biomarker Clinic,US,NA,CRA-04,CRA-01,ENROLLMENT_PAUSED,20,9,21,12,2026-09-27,52,41
+SITE-110,NCT-SYN-0309,Ile-de-France Neurocognitive Center,FR,EMEA,CRA-02,CRA-03,ACTIVE,20,7,19,12,2026-10-01,48,18
+SITE-111,NCT-SYN-0309,Bavaria Translational Neuro Site,DE,EMEA,CRA-02,CRA-01,ACTIVE,20,15,22,7,2026-10-24,25,10
+SITE-112,NCT-SYN-0309,Marina Bay Neuroscience Center,SG,APAC,CRA-03,CRA-02,ACTIVE,20,16,23,7,2026-10-27,22,7
+SITE-113,NCT-SYN-0412,Midwest Mucosal Immunology Clinic,US,NA,CRA-01,CRA-04,ACTIVE,28,15,31,16,2026-09-24,55,14
+SITE-114,NCT-SYN-0412,Thames Valley Gastroenterology Unit,UK,EMEA,CRA-02,CRA-03,ACTIVE,28,10,25,15,2026-09-16,63,33
+SITE-115,NCT-SYN-0412,Tokyo Metropolitan GI Research Hospital,JP,APAC,CRA-03,CRA-01,ACTIVE,27,17,29,12,2026-10-10,39,13
+SITE-116,NCT-SYN-0412,Sydney Translational Immunology Site,AU,APAC,CRA-03,CRA-04,ACTIVE,27,22,30,8,2026-11-01,17,5

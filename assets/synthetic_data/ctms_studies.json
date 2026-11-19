@@ -1,0 +1,46 @@
+[
+  {
+    "study_id": "NCT-SYN-0101",
+    "protocol_code": "ONCO-301",
+    "title": "Phase III Randomized Study of Selective Kinase/PD-L1 Regimen in Advanced NSCLC",
+    "phase": "Phase III",
+    "therapeutic_area": "Oncology",
+    "target_enrollment": 120,
+    "current_icf_version": "v3.0",
+    "sae_target_days": 7,
+    "baseline_sae_days": 28
+  },
+  {
+    "study_id": "NCT-SYN-0204",
+    "protocol_code": "CARDIO-204",
+    "title": "Phase IIb Cardiorenal Remodeling Trial in Reduced Ejection Fraction Heart Failure",
+    "phase": "Phase IIb",
+    "therapeutic_area": "Cardiology",
+    "target_enrollment": 100,
+    "current_icf_version": "v2.1",
+    "sae_target_days": 7,
+    "baseline_sae_days": 28
+  },
+  {
+    "study_id": "NCT-SYN-0309",
+    "protocol_code": "NEURO-309",
+    "title": "Phase II CSF pTau-217 Guided Synaptic Protection Trial in Early Prodromal Decline",
+    "phase": "Phase II",
+    "therapeutic_area": "Neurology",
+    "target_enrollment": 80,
+    "current_icf_version": "v2.0",
+    "sae_target_days": 7,
+    "baseline_sae_days": 28
+  },
+  {
+    "study_id": "NCT-SYN-0412",
+    "protocol_code": "IMMUNO-412",
+    "title": "Phase III Dual-Cytokine Blockade Study in Moderate-to-Severe Active IBD",
+    "phase": "Phase III",
+    "therapeutic_area": "Immunology",
+    "target_enrollment": 110,
+    "current_icf_version": "v4.0",
+    "sae_target_days": 7,
+    "baseline_sae_days": 28
+  }
+]

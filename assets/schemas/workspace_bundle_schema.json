@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ClinicalTrialsWorkbenchBundle",
+  "type": "object",
+  "required": [
+    "metadata",
+    "portfolio_summary",
+    "studies",
+    "sites",
+    "signals",
+    "patient_selection",
+    "analytics_catalog",
+    "provenance"
+  ],
+  "properties": {
+    "metadata": {
+      "type": "object",
+      "required": ["generated_at", "system_theme", "reference_date", "schema_version", "synthetic_data_only"],
+      "properties": {
+        "generated_at": { "type": "string" },
+        "system_theme": { "type": "string", "enum": ["light", "dark"] },
+        "reference_date": { "type": "string" },
+        "schema_version": { "type": "string" },
+        "synthetic_data_only": { "type": "boolean", "const": true }
+      }
+    },
+    "portfolio_summary": {
+      "type": "object",
+      "required": [
+        "executive_briefing",
+        "total_sites",
+        "tier_counts",
+        "active_signal_count",
+        "median_sae_cycle_days",
+        "sae_target_days",
+        "sae_baseline_days",
+        "eligible_patient_count"
+      ]
+    },
+    "studies": { "type": "array" },
+    "sites": { "type": "array" },
+    "signals": { "type": "array" },
+    "patient_selection": {
+      "type": "object",
+      "required": ["patients", "evaluations", "summary_by_study"]
+    },
+    "analytics_catalog": { "type": "array" },
+    "provenance": { "type": "object" }
+  }
+}

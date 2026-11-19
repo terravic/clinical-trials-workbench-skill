@@ -1,0 +1,184 @@
+{
+  "training_records": [
+    {
+      "training_id": "TRN-401",
+      "site_id": "SITE-101",
+      "staff_role_id": "SUBINV-101A",
+      "cert_type": "PROTOCOL_AMENDMENT",
+      "status": "EXPIRED",
+      "days_until_expiry": -9
+    },
+    {
+      "training_id": "TRN-402",
+      "site_id": "SITE-102",
+      "staff_role_id": "COORD-102B",
+      "cert_type": "IRT_EDC_SYSTEM",
+      "status": "INCOMPLETE",
+      "days_until_expiry": 20
+    },
+    {
+      "training_id": "TRN-403",
+      "site_id": "SITE-103",
+      "staff_role_id": "COORD-103A",
+      "cert_type": "GCP",
+      "status": "EXPIRING_SOON",
+      "days_until_expiry": 11
+    },
+    {
+      "training_id": "TRN-404",
+      "site_id": "SITE-104",
+      "staff_role_id": "PI-104A",
+      "cert_type": "GCP",
+      "status": "ACTIVE",
+      "days_until_expiry": 240
+    },
+    {
+      "training_id": "TRN-405",
+      "site_id": "SITE-105",
+      "staff_role_id": "PHARM-105A",
+      "cert_type": "GCP",
+      "status": "EXPIRING_SOON",
+      "days_until_expiry": 8
+    },
+    {
+      "training_id": "TRN-406",
+      "site_id": "SITE-106",
+      "staff_role_id": "SUBINV-106B",
+      "cert_type": "PROTOCOL_AMENDMENT",
+      "status": "EXPIRED",
+      "days_until_expiry": -14
+    },
+    {
+      "training_id": "TRN-407",
+      "site_id": "SITE-108",
+      "staff_role_id": "PI-108A",
+      "cert_type": "GCP",
+      "status": "ACTIVE",
+      "days_until_expiry": 310
+    },
+    {
+      "training_id": "TRN-408",
+      "site_id": "SITE-109",
+      "staff_role_id": "COORD-109A",
+      "cert_type": "GCP",
+      "status": "EXPIRED",
+      "days_until_expiry": -18
+    },
+    {
+      "training_id": "TRN-409",
+      "site_id": "SITE-110",
+      "staff_role_id": "COORD-110B",
+      "cert_type": "IRT_EDC_SYSTEM",
+      "status": "INCOMPLETE",
+      "days_until_expiry": 15
+    },
+    {
+      "training_id": "TRN-410",
+      "site_id": "SITE-111",
+      "staff_role_id": "PI-111A",
+      "cert_type": "GCP",
+      "status": "ACTIVE",
+      "days_until_expiry": 195
+    },
+    {
+      "training_id": "TRN-411",
+      "site_id": "SITE-113",
+      "staff_role_id": "SUBINV-113A",
+      "cert_type": "GCP",
+      "status": "EXPIRED",
+      "days_until_expiry": -22
+    },
+    {
+      "training_id": "TRN-412",
+      "site_id": "SITE-114",
+      "staff_role_id": "COORD-114A",
+      "cert_type": "GCP",
+      "status": "EXPIRING_SOON",
+      "days_until_expiry": 6
+    },
+    {
+      "training_id": "TRN-413",
+      "site_id": "SITE-115",
+      "staff_role_id": "SUBINV-115B",
+      "cert_type": "PROTOCOL_AMENDMENT",
+      "status": "EXPIRED",
+      "days_until_expiry": -5
+    },
+    {
+      "training_id": "TRN-414",
+      "site_id": "SITE-116",
+      "staff_role_id": "PI-116A",
+      "cert_type": "GCP",
+      "status": "ACTIVE",
+      "days_until_expiry": 275
+    }
+  ],
+  "quality_issues": [
+    {
+      "issue_id": "ISS-801",
+      "site_id": "SITE-101",
+      "study_id": "NCT-SYN-0101",
+      "category": "CONSENT_PROCESS",
+      "priority": "HIGH",
+      "status": "CAPA_IN_PROGRESS",
+      "days_open": 24,
+      "overdue_capa": 1,
+      "summary": "Re-consent tracking log missing version control check after Amendment v3.0."
+    },
+    {
+      "issue_id": "ISS-802",
+      "site_id": "SITE-102",
+      "study_id": "NCT-SYN-0101",
+      "category": "DATA_ENTRY_LAG",
+      "priority": "MEDIUM",
+      "status": "OPEN",
+      "days_open": 16,
+      "overdue_capa": 0,
+      "summary": "Backup coordinator turnover created 3-week eCRF transcription backlog."
+    },
+    {
+      "issue_id": "ISS-803",
+      "site_id": "SITE-105",
+      "study_id": "NCT-SYN-0204",
+      "category": "COLD_CHAIN_STORAGE",
+      "priority": "CRITICAL",
+      "status": "OPEN",
+      "days_open": 7,
+      "overdue_capa": 0,
+      "summary": "Pharmacy refrigerator excursion (+11.4C for 3 hours) awaiting stability disposition."
+    },
+    {
+      "issue_id": "ISS-804",
+      "site_id": "SITE-109",
+      "study_id": "NCT-SYN-0309",
+      "category": "REGULATORY_HOLD_CAPA",
+      "priority": "CRITICAL",
+      "status": "CAPA_IN_PROGRESS",
+      "days_open": 31,
+      "overdue_capa": 1,
+      "summary": "Enrollment paused pending IRB notification and CAPA verification on pre-consent assessment."
+    },
+    {
+      "issue_id": "ISS-805",
+      "site_id": "SITE-113",
+      "study_id": "NCT-SYN-0412",
+      "category": "SAFETY_REPORTING",
+      "priority": "CRITICAL",
+      "status": "CAPA_IN_PROGRESS",
+      "days_open": 28,
+      "overdue_capa": 1,
+      "summary": "Delayed hospital discharge summary retrieval caused 29-day SAE follow-up lag."
+    },
+    {
+      "issue_id": "ISS-806",
+      "site_id": "SITE-114",
+      "study_id": "NCT-SYN-0412",
+      "category": "SCREENING_FUNNEL",
+      "priority": "MEDIUM",
+      "status": "OPEN",
+      "days_open": 19,
+      "overdue_capa": 0,
+      "summary": "High screen failure rate linked to outdated local calprotectin pre-screen cutoff."
+    }
+  ]
+}

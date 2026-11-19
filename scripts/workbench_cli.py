@@ -1,0 +1,629 @@
+"""Unified CLI Orchestrator and HTTP/SSE Workbench Server.
+
+Primary programmatic interface invoked by Agent Harnesses executing SKILL.md
+and by human operators from the terminal. Supports portfolio triage, single-site
+monitoring preparation, signal audit & HITL feedback, clinical trial patient
+selection, guardrailed SQL analytics, standalone dashboard generation, and live
+Server-Sent Events (SSE) streaming.
+"""
+
+from __future__ import annotations
+
+import argparse
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+from pathlib import Path
+import queue
+import sys
+import threading
+from typing import Any
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from scripts import (
+    DEFAULT_DASHBOARD_PATH,
+    EntityNotFoundError,
+    SQLSafetyError,
+    WorkbenchError,
+    configure_logging,
+)
+from scripts.action_drafter import (
+    build_portfolio_executive_briefing,
+    draft_issue_payload,
+    draft_monitoring_visit_agenda,
+    draft_site_followup_email,
+    load_feedback_state,
+    record_signal_feedback,
+)
+from scripts.analytics_assistant import answer_analytics_question
+from scripts.build_dashboard import build_standalone_dashboard, compile_workspace_bundle
+from scripts.data_ingestor import ingest_workspace_data
+from scripts.generate_synthetic_data import generate_all_synthetic_data
+from scripts.signal_engine import evaluate_signals_and_sites, get_signal_by_id
+from scripts.trial_selector import run_trial_selection
+
+
+def _prepare_runtime_context(
+    data_dir: str | None, state_file: str | None, strict: bool
+) -> tuple[Any, dict[str, Any], dict[str, Any]]:
+    """Ingest feeds, run selection & signal engines, and return (conn, signal_bundle, selection_bundle)."""
+    conn, _ = ingest_workspace_data(data_dir=data_dir, strict=strict)
+    feedback = load_feedback_state(state_file=state_file, strict=strict)
+    run_trial_selection(conn, persist_table=True)
+    signal_bundle = evaluate_signals_and_sites(conn, feedback_map=feedback)
+    risk_map = {s["site_id"]: s["risk_score"] for s in signal_bundle["sites"]}
+    selection_bundle = run_trial_selection(
+        conn, site_risk_scores=risk_map, persist_table=True
+    )
+    return conn, signal_bundle, selection_bundle
+
+
+def _format_portfolio_markdown(
+    briefing: dict[str, Any], sites: list[dict[str, Any]]
+) -> str:
+    lines = [
+        "# Level 1: Clinical Portfolio Workbench Summary",
+        "",
+        briefing["executive_briefing"],
+        "",
+        "## Priority Tier Distribution",
+        f"- **Priority Action Required:** {briefing['tier_counts']['Priority Action Required']} sites",
+        f"- **Important Signals Next:** {briefing['tier_counts']['Important Signals Next']} sites",
+        f"- **Continue to Monitor:** {briefing['tier_counts']['Continue to Monitor']} sites",
+        f"- **Closed SAE Median Turnaround:** {briefing['submitted_sae_median_days']} days (Target: {briefing['sae_target_days']} days; Legacy Baseline: {briefing['sae_baseline_days']} days)",
+        f"- **Eligible Trial Candidates:** {briefing['eligible_patient_count']} ready | {briefing['potential_needs_labs_count']} awaiting lab refresh",
+        "",
+        "## Clinical Sites Ranked by Risk Score",
+        "| Site ID | Protocol | Region | CRA | Priority Tier | Risk Score | Crit/Total Signals | Enrolled | Local Eligible |",
+        "|---|---|---|---|---|---:|---:|---:|---:|",
+    ]
+    for s in sorted(sites, key=lambda x: (-x["risk_score"], x["site_id"])):
+        lines.append(
+            f"| {s['site_id']} | {s['protocol_code']} | {s['region']} | {s['assigned_cra_id']} | "
+            f"{s['priority_tier']} | {s['risk_score']} | {s['signal_counts']['CRITICAL']}/{s['signal_counts']['TOTAL']} | "
+            f"{s['enrolled_count']}/{s['target_enrollment']} | {s['local_eligible_candidates']} |"
+        )
+    return "\n".join(lines)
+
+
+def _format_selection_markdown(
+    evaluations: list[dict[str, Any]],
+    patients_by_id: dict[str, dict[str, Any]],
+    summary_by_study: list[dict[str, Any]],
+    single_patient_audit: dict[str, Any] | None = None,
+) -> str:
+    lines = [
+        "# Clinical Trial Selection Workbench Report",
+        "",
+        "## Study Eligibility Funnel Summary",
+        "| Study ID | Protocol | ELIGIBLE | POTENTIAL_NEEDS_LABS | INELIGIBLE |",
+        "|---|---|---:|---:|---:|",
+    ]
+    for row in summary_by_study:
+        lines.append(
+            f"| {row['study_id']} | {row['protocol_code']} | {row['ELIGIBLE']} | "
+            f"{row['POTENTIAL_NEEDS_LABS']} | {row['INELIGIBLE']} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            f"## Matched Candidate Evaluations ({len(evaluations)} shown)",
+            "| Patient ID | Age/Sex | Region | ICD-10 | Study | Classification | Score | Recommended Site | Missing / Failed Criteria |",
+            "|---|---|---|---|---|---|---:|---|---|",
+        ]
+    )
+    for ev in evaluations:
+        p = patients_by_id[ev["patient_id"]]
+        notes = ev["failed_criteria"] or ev["missing_criteria"] or ["All passed"]
+        lines.append(
+            f"| {ev['patient_id']} | {p['age_years']}/{p['sex']} | {p['region']} | {p['primary_icd10']} | "
+            f"{ev['protocol_code']} | {ev['classification']} | {ev['match_score']} | "
+            f"{ev['recommended_site_id'] or 'None'} | {', '.join(notes[:3])} |"
+        )
+
+    if single_patient_audit:
+        lines.extend(
+            [
+                "",
+                f"## Criterion-by-Criterion Audit: {single_patient_audit['patient_id']} ({single_patient_audit['protocol_code']})",
+                "| Criterion | Category | Status | Observed | Requirement |",
+                "|---|---|---|---|---|",
+            ]
+        )
+        for c in single_patient_audit["criteria_audit"]:
+            lines.append(
+                f"| {c['criterion_id']} | {c['category']} | {c['status']} | {c['observed']} | {c['requirement']} |"
+            )
+    return "\n".join(lines)
+
+
+def create_workbench_http_server(
+    host: str,
+    port: int,
+    dashboard_path: Path,
+    data_dir: str | None = None,
+    state_file: str | None = None,
+) -> ThreadingHTTPServer:
+    """Create a thread-safe local HTTP + Server-Sent Events (SSE) workbench server."""
+    subscribers: list[queue.Queue[str]] = []
+    sub_lock = threading.Lock()
+
+    def broadcast_update() -> None:
+        bundle = compile_workspace_bundle(data_dir=data_dir, state_file=state_file)
+        payload = json.dumps(bundle, separators=(",", ":"))
+        with sub_lock:
+            for q in list(subscribers):
+                try:
+                    q.put_nowait(payload)
+                except queue.Full:
+                    pass
+
+    class WorkbenchRequestHandler(BaseHTTPRequestHandler):
+        def log_message(self, fmt: str, *args: Any) -> None:
+            return  # Keep terminal output quiet unless structured logger enabled
+
+        def _send_json(self, status: int, data: dict[str, Any]) -> None:
+            body = json.dumps(data).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self) -> None:  # noqa: N802
+            if self.path in ("/", "/dashboard.html"):
+                html_bytes = dashboard_path.read_bytes()
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(html_bytes)))
+                self.end_headers()
+                try:
+                    self.wfile.write(html_bytes)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+                return
+
+            if self.path == "/api/bundle":
+                bundle = compile_workspace_bundle(data_dir=data_dir, state_file=state_file)
+                self._send_json(HTTPStatus.OK, bundle)
+                return
+
+            if self.path.startswith("/events"):
+                is_once = "once=1" in self.path
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close" if is_once else "keep-alive")
+                self.end_headers()
+                client_q: queue.Queue[str] = queue.Queue(maxsize=8)
+                with sub_lock:
+                    subscribers.append(client_q)
+                try:
+                    # Emit initial heartbeat event immediately
+                    self.wfile.write(b"event: connected\ndata: {\"status\":\"ok\"}\n\n")
+                    self.wfile.flush()
+                    if is_once:
+                        self.close_connection = True
+                        return
+                    while True:
+                        try:
+                            msg = client_q.get(timeout=15.0)
+                            frame = f"event: workspace_update\ndata: {msg}\n\n".encode("utf-8")
+                            self.wfile.write(frame)
+                            self.wfile.flush()
+                        except queue.Empty:
+                            self.wfile.write(b": heartbeat\n\n")
+                            self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+                finally:
+                    with sub_lock:
+                        if client_q in subscribers:
+                            subscribers.remove(client_q)
+                return
+
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Unknown endpoint: {self.path}"})
+
+        def do_POST(self) -> None:  # noqa: N802
+            length = int(self.headers.get("Content-Length", "0"))
+            raw_body = self.rfile.read(length).decode("utf-8") if length > 0 else "{}"
+            try:
+                req = json.loads(raw_body)
+            except json.JSONDecodeError:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Invalid JSON body"})
+                return
+
+            if self.path == "/api/ask":
+                conn, _, _ = _prepare_runtime_context(data_dir, state_file, strict=False)
+                try:
+                    ans = answer_analytics_question(
+                        conn,
+                        question=req.get("question"),
+                        custom_sql=req.get("sql"),
+                    )
+                    self._send_json(HTTPStatus.OK, ans)
+                except (SQLSafetyError, ValueError) as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                finally:
+                    conn.close()
+                return
+
+            if self.path == "/api/feedback":
+                try:
+                    entry = record_signal_feedback(
+                        signal_id=str(req["signal_id"]),
+                        disposition=str(req["disposition"]),
+                        note=str(req.get("note", "")),
+                        reviewer_id=str(req.get("reviewer_id", "CRA-01")),
+                        state_file=state_file,
+                    )
+                    build_standalone_dashboard(
+                        output_path=dashboard_path,
+                        data_dir=data_dir,
+                        state_file=state_file,
+                    )
+                    broadcast_update()
+                    self._send_json(HTTPStatus.OK, {"status": "saved", "feedback": entry})
+                except (KeyError, ValueError) as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Unknown POST route: {self.path}"})
+
+    return ThreadingHTTPServer((host, port), WorkbenchRequestHandler)
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="workbench_cli.py",
+        description="Clinical Trials System of Action and Selection Workbench CLI.",
+    )
+    parser.add_argument(
+        "--data-dir",
+        default=None,
+        help="Path to clinical data feeds (default: assets/synthetic_data or CTW_DATA_DIR).",
+    )
+    parser.add_argument(
+        "--state-file",
+        default=None,
+        help="Path to HITL feedback JSON file (default: assets/workbench_feedback_state.json).",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Abort with non-zero exit code on any malformed or out-of-range record instead of quarantining.",
+    )
+
+    sub_common = argparse.ArgumentParser(add_help=False)
+    sub_common.add_argument("--data-dir", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    sub_common.add_argument("--state-file", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    sub_common.add_argument(
+        "--strict", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS
+    )
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # generate-data
+    p_gen = sub.add_parser("generate-data", parents=[sub_common], help="Generate deterministic 10-feed synthetic clinical data.")
+    p_gen.add_argument("--output-dir", default=None, help="Target synthetic data folder.")
+    p_gen.add_argument("--seed", type=int, default=42, help="Random seed (default: 42).")
+
+    # portfolio
+    p_port = sub.add_parser("portfolio", parents=[sub_common], help="Level 1 Portfolio triage and executive summary.")
+    p_port.add_argument("--cra", default="ALL", help="CRA scope filter (e.g., CRA-01 or ALL).")
+    p_port.add_argument("--no-peer", action="store_true", help="Exclude peer-coverage sites.")
+    p_port.add_argument("--tier", default=None, help="Filter sites by priority tier.")
+    p_port.add_argument("--format", choices=["markdown", "json"], default="markdown")
+
+    # site
+    p_site = sub.add_parser("site", parents=[sub_common], help="Level 2 Single-Site view and visit/email drafting.")
+    p_site.add_argument("--site-id", required=True, help="Target clinical site ID (e.g., SITE-101).")
+    p_site.add_argument("--signals", default=None, help="Comma-separated signal IDs to include in drafts.")
+    p_site.add_argument("--draft-agenda", action="store_true", help="Include Monitoring Visit Agenda draft.")
+    p_site.add_argument("--draft-email", action="store_true", help="Include Site Follow-Up Email draft.")
+    p_site.add_argument("--format", choices=["markdown", "json"], default="markdown")
+
+    # signal
+    p_sig = sub.add_parser("signal", parents=[sub_common], help="Level 3 Signal evidence audit, issue export, and HITL feedback.")
+    p_sig.add_argument("--signal-id", required=True, help="Signal identifier (e.g., SIG-1001).")
+    p_sig.add_argument("--draft-issue", action="store_true", help="Include exportable Issue/CAPA JSON.")
+    p_sig.add_argument("--feedback", choices=["ACCEPT", "MODIFY", "DISMISS"], default=None)
+    p_sig.add_argument("--note", default="", help="Reviewer rationale note for HITL feedback.")
+    p_sig.add_argument("--reviewer", default="CRA-01", help="Reviewer role ID.")
+    p_sig.add_argument("--format", choices=["markdown", "json"], default="markdown")
+
+    # select-patients
+    p_sel = sub.add_parser("select-patients", parents=[sub_common], help="Clinical Trial Patient Selection and Site Matcher.")
+    p_sel.add_argument("--study-id", default=None, help="Filter by study ID (e.g., NCT-SYN-0101).")
+    p_sel.add_argument("--status", choices=["ELIGIBLE", "POTENTIAL_NEEDS_LABS", "INELIGIBLE"], default=None)
+    p_sel.add_argument("--site-id", default=None, help="Filter by recommended site ID.")
+    p_sel.add_argument("--region", choices=["NA", "EMEA", "APAC"], default=None)
+    p_sel.add_argument("--patient-id", default=None, help="Inspect specific patient ID (e.g., PAT-10001).")
+    p_sel.add_argument("--min-score", type=int, default=None, help="Minimum composite match score (0-100).")
+    p_sel.add_argument("--limit", type=int, default=25, help="Max rows in output (default: 25).")
+    p_sel.add_argument("--format", choices=["markdown", "json"], default="markdown")
+
+    # ask
+    p_ask = sub.add_parser("ask", parents=[sub_common], help="Conversational Analytics & Guarded Read-Only SQL Explorer.")
+    p_ask.add_argument("--question", default=None, help="Natural-language clinical/operational question.")
+    p_ask.add_argument("--sql", default=None, help="Direct read-only SQLite SELECT query.")
+    p_ask.add_argument("--format", choices=["markdown", "json"], default="markdown")
+
+    # build-dashboard
+    p_dash = sub.add_parser("build-dashboard", parents=[sub_common], help="Build standalone interactive dashboard.html.")
+    p_dash.add_argument("--output", default=None, help="Output HTML file path (default: dashboard.html).")
+
+    # serve
+    p_srv = sub.add_parser("serve", parents=[sub_common], help="Serve dashboard.html over HTTP with live SSE /events streaming.")
+    p_srv.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1).")
+    p_srv.add_argument("--port", type=int, default=8765, help="TCP port (default: 8765).")
+    p_srv.add_argument("--output", default=None, help="Dashboard path (default: dashboard.html).")
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    configure_logging()
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        if args.command == "generate-data":
+            out_dir = args.output_dir or args.data_dir
+            res = generate_all_synthetic_data(output_dir=out_dir, seed=args.seed)
+            print(json.dumps(res, indent=2))
+            return 0
+
+        if args.command == "build-dashboard":
+            res = build_standalone_dashboard(
+                output_path=args.output,
+                data_dir=args.data_dir,
+                state_file=args.state_file,
+                strict=args.strict,
+            )
+            print(json.dumps(res, indent=2))
+            return 0
+
+        if args.command == "serve":
+            dash_info = build_standalone_dashboard(
+                output_path=args.output,
+                data_dir=args.data_dir,
+                state_file=args.state_file,
+                strict=args.strict,
+            )
+            dash_path = Path(dash_info["dashboard_path"])
+            server = create_workbench_http_server(
+                args.host,
+                args.port,
+                dash_path,
+                data_dir=args.data_dir,
+                state_file=args.state_file,
+            )
+            print(f"Serving Clinical Trials Workbench at http://{args.host}:{args.port} (SSE /events active)")
+            try:
+                server.serve_forever()
+            except KeyboardInterrupt:
+                pass
+            finally:
+                server.server_close()
+            return 0
+
+        conn, signal_bundle, selection_bundle = _prepare_runtime_context(
+            args.data_dir, args.state_file, args.strict
+        )
+        try:
+            if args.command == "portfolio":
+                briefing = build_portfolio_executive_briefing(
+                    signal_bundle,
+                    selection_bundle,
+                    cra_filter=args.cra,
+                    include_peer_sites=not args.no_peer,
+                )
+                sites = signal_bundle["sites"]
+                if args.cra and args.cra.upper() != "ALL":
+                    cu = args.cra.upper()
+                    sites = [
+                        s
+                        for s in sites
+                        if s["assigned_cra_id"] == cu or (not args.no_peer and s["peer_cra_id"] == cu)
+                    ]
+                if args.tier:
+                    sites = [s for s in sites if s["priority_tier"].lower() == args.tier.lower()]
+
+                if args.format == "json":
+                    print(json.dumps({"portfolio_summary": briefing, "sites": sites}, indent=2))
+                else:
+                    print(_format_portfolio_markdown(briefing, sites))
+                return 0
+
+            if args.command == "site":
+                site = next(
+                    (s for s in signal_bundle["sites"] if s["site_id"] == args.site_id), None
+                )
+                if site is None:
+                    raise EntityNotFoundError(
+                        f"Unknown site_id '{args.site_id}'. Valid sites: {[s['site_id'] for s in signal_bundle['sites']]}"
+                    )
+                sig_filter = (
+                    [x.strip() for x in args.signals.split(",") if x.strip()]
+                    if args.signals
+                    else None
+                )
+                agenda = (
+                    draft_monitoring_visit_agenda(
+                        args.site_id, signal_bundle, selection_bundle, sig_filter
+                    )
+                    if args.draft_agenda
+                    else None
+                )
+                email = (
+                    draft_site_followup_email(args.site_id, signal_bundle, sig_filter)
+                    if args.draft_email
+                    else None
+                )
+                site_sigs = [s for s in signal_bundle["signals"] if s["site_id"] == args.site_id]
+
+                if args.format == "json":
+                    print(
+                        json.dumps(
+                            {
+                                "site": site,
+                                "signals": site_sigs,
+                                "monitoring_visit_agenda": agenda,
+                                "followup_email_draft": email,
+                            },
+                            indent=2,
+                        )
+                    )
+                else:
+                    blocks = [
+                        f"# Level 2: Single-Site Summary — {site['site_id']} ({site['site_name']})",
+                        f"- **Protocol:** {site['protocol_code']} ({site['study_id']})",
+                        f"- **Priority Tier:** {site['priority_tier']} (Risk Score: {site['risk_score']}/100)",
+                        f"- **Status / Last Visit:** {site['site_status']} / {site['last_monitoring_date']} ({site['days_since_monitoring']}d ago)",
+                        f"- **Summary:** {site['site_summary']}",
+                    ]
+                    if agenda:
+                        blocks.extend(["", "---", "", agenda])
+                    if email:
+                        blocks.extend(["", "---", "", "## Follow-Up Email Draft", "```text", email, "```"])
+                    print("\n".join(blocks))
+                return 0
+
+            if args.command == "signal":
+                sig = get_signal_by_id(signal_bundle["signals"], args.signal_id)
+                feedback_entry = None
+                if args.feedback:
+                    feedback_entry = record_signal_feedback(
+                        signal_id=args.signal_id,
+                        disposition=args.feedback,
+                        note=args.note,
+                        reviewer_id=args.reviewer,
+                        state_file=args.state_file,
+                    )
+                    sig["disposition"] = feedback_entry["disposition"]
+                    sig["reviewer_note"] = feedback_entry["note"]
+
+                issue_json = (
+                    draft_issue_payload(args.signal_id, signal_bundle)
+                    if args.draft_issue
+                    else None
+                )
+                if args.format == "json":
+                    print(
+                        json.dumps(
+                            {
+                                "signal": sig,
+                                "feedback_recorded": feedback_entry,
+                                "issue_payload": issue_json,
+                            },
+                            indent=2,
+                        )
+                    )
+                else:
+                    ev = sig["evidence"]
+                    md = [
+                        f"# Level 3: Signal Detail & Evidence — {sig['signal_id']}",
+                        f"- **Title:** {sig['title']} (`{sig['rule_id']}` | `{sig['family']}`)",
+                        f"- **Severity / Weight:** {sig['severity']} ({sig['weight']})",
+                        f"- **Clinical Site / Study:** {sig['site_id']} ({sig['site_name']}) / {sig['protocol_code']}",
+                        f"- **Disposition:** {sig['disposition']}",
+                        f"- **Provenance Citation:** `{ev['source_file']}` -> record `{ev['source_record_id']}` (`{ev['metric_name']} = {ev['observed_value']}`, threshold `{ev['threshold_value']}`)",
+                        f"- **Historical 8-Week Site Trend:** {sig['site_weekly_trend']}",
+                        f"- **Rationale:** {sig['rationale']}",
+                        f"- **Recommended Action:** {sig['recommended_action']}",
+                    ]
+                    if issue_json:
+                        md.extend(["", "## Issue / CAPA Export Payload", "```json", json.dumps(issue_json, indent=2), "```"])
+                    print("\n".join(md))
+                return 0
+
+            if args.command == "select-patients":
+                risk_map = {s["site_id"]: s["risk_score"] for s in signal_bundle["sites"]}
+                sel = run_trial_selection(
+                    conn,
+                    study_id=args.study_id,
+                    status_filter=args.status,
+                    site_id_filter=args.site_id,
+                    region_filter=args.region,
+                    min_score=args.min_score,
+                    site_risk_scores=risk_map,
+                    persist_table=False,
+                )
+                evals = sel["evaluations"]
+                single_audit = None
+                if args.patient_id:
+                    evals = [e for e in evals if e["patient_id"] == args.patient_id]
+                    if not evals:
+                        raise EntityNotFoundError(
+                            f"No matching evaluations found for patient_id '{args.patient_id}'."
+                        )
+                    single_audit = evals[0]
+
+                evals_limited = evals[: max(1, args.limit)]
+                pat_map = {p["patient_id"]: p for p in sel["patients"]}
+                if args.format == "json":
+                    print(
+                        json.dumps(
+                            {
+                                "summary_by_study": sel["summary_by_study"],
+                                "count": len(evals),
+                                "evaluations": evals_limited,
+                            },
+                            indent=2,
+                        )
+                    )
+                else:
+                    print(
+                        _format_selection_markdown(
+                            evals_limited, pat_map, sel["summary_by_study"], single_audit
+                        )
+                    )
+                return 0
+
+            if args.command == "ask":
+                ans = answer_analytics_question(
+                    conn, question=args.question, custom_sql=args.sql
+                )
+                if args.format == "json":
+                    print(json.dumps(ans, indent=2))
+                else:
+                    lines = [
+                        "# Conversational Analytics Result",
+                        f"**Question:** {ans['question']}",
+                        "",
+                        f"**Synthesis:** {ans['narrative']}",
+                        "",
+                        "## Generated Read-Only SQL",
+                        "```sql",
+                        ans["sql"],
+                        "```",
+                        "",
+                        f"## Underlying Data ({len(ans['rows'])} rows; Sources: {', '.join(ans['provenance_sources'])})",
+                    ]
+                    if ans["columns"] and ans["rows"]:
+                        lines.append("| " + " | ".join(ans["columns"]) + " |")
+                        lines.append("|" + "|".join(["---"] * len(ans["columns"])) + "|")
+                        for r in ans["rows"]:
+                            lines.append("| " + " | ".join(str(r[c]) for c in ans["columns"]) + " |")
+                    print("\n".join(lines))
+                return 0
+
+        finally:
+            conn.close()
+
+    except WorkbenchError as exc:
+        print(f"ERROR [{exc.__class__.__name__}]: {exc}", file=sys.stderr)
+        return exc.exit_code
+    except ValueError as exc:
+        print(f"ERROR [ValueError]: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

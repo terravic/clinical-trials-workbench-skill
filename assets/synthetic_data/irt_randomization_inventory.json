@@ -1,0 +1,162 @@
+[
+  {
+    "site_id": "SITE-101",
+    "study_id": "NCT-SYN-0101",
+    "available_kits": 11,
+    "min_buffer_kits": 8,
+    "resupply_in_transit": 1,
+    "temp_excursion_count": 0,
+    "unresolved_excursion": 0,
+    "median_rand_to_dose_days": 3.2
+  },
+  {
+    "site_id": "SITE-102",
+    "study_id": "NCT-SYN-0101",
+    "available_kits": 6,
+    "min_buffer_kits": 8,
+    "resupply_in_transit": 1,
+    "temp_excursion_count": 0,
+    "unresolved_excursion": 0,
+    "median_rand_to_dose_days": 4.5
+  },
+  {
+    "site_id": "SITE-103",
+    "study_id": "NCT-SYN-0101",
+    "available_kits": 9,
+    "min_buffer_kits": 8,
+    "resupply_in_transit": 0,
+    "temp_excursion_count": 1,
+    "unresolved_excursion": 0,
+    "median_rand_to_dose_days": 3.8
+  },
+  {
+    "site_id": "SITE-104",
+    "study_id": "NCT-SYN-0101",
+    "available_kits": 18,
+    "min_buffer_kits": 8,
+    "resupply_in_transit": 1,
+    "temp_excursion_count": 0,
+    "unresolved_excursion": 0,
+    "median_rand_to_dose_days": 2.1
+  },
+  {
+    "site_id": "SITE-105",
+    "study_id": "NCT-SYN-0204",
+    "available_kits": 4,
+    "min_buffer_kits": 8,
+    "resupply_in_transit": 0,
+    "temp_excursion_count": 2,
+    "unresolved_excursion": 1,
+    "median_rand_to_dose_days": 6.4
+  },
+  {
+    "site_id": "SITE-106",
+    "study_id": "NCT-SYN-0204",
+    "available_kits": 9,
+    "min_buffer_kits": 8,
+    "resupply_in_transit": 0,
+    "temp_excursion_count": 0,
+    "unresolved_excursion": 0,
+    "median_rand_to_dose_days": 4.9
+  },
+  {
+    "site_id": "SITE-107",
+    "study_id": "NCT-SYN-0204",
+    "available_kits": 7,
+    "min_buffer_kits": 8,
+    "resupply_in_transit": 1,
+    "temp_excursion_count": 0,
+    "unresolved_excursion": 0,
+    "median_rand_to_dose_days": 5.6
+  },
+  {
+    "site_id": "SITE-108",
+    "study_id": "NCT-SYN-0204",
+    "available_kits": 16,
+    "min_buffer_kits": 8,
+    "resupply_in_transit": 1,
+    "temp_excursion_count": 0,
+    "unresolved_excursion": 0,
+    "median_rand_to_dose_days": 2.4
+  },
+  {
+    "site_id": "SITE-109",
+    "study_id": "NCT-SYN-0309",
+    "available_kits": 10,
+    "min_buffer_kits": 6,
+    "resupply_in_transit": 0,
+    "temp_excursion_count": 1,
+    "unresolved_excursion": 0,
+    "median_rand_to_dose_days": 4.8
+  },
+  {
+    "site_id": "SITE-110",
+    "study_id": "NCT-SYN-0309",
+    "available_kits": 7,
+    "min_buffer_kits": 6,
+    "resupply_in_transit": 0,
+    "temp_excursion_count": 0,
+    "unresolved_excursion": 0,
+    "median_rand_to_dose_days": 5.8
+  },
+  {
+    "site_id": "SITE-111",
+    "study_id": "NCT-SYN-0309",
+    "available_kits": 14,
+    "min_buffer_kits": 6,
+    "resupply_in_transit": 1,
+    "temp_excursion_count": 0,
+    "unresolved_excursion": 0,
+    "median_rand_to_dose_days": 2.9
+  },
+  {
+    "site_id": "SITE-112",
+    "study_id": "NCT-SYN-0309",
+    "available_kits": 15,
+    "min_buffer_kits": 6,
+    "resupply_in_transit": 1,
+    "temp_excursion_count": 0,
+    "unresolved_excursion": 0,
+    "median_rand_to_dose_days": 2.5
+  },
+  {
+    "site_id": "SITE-113",
+    "study_id": "NCT-SYN-0412",
+    "available_kits": 5,
+    "min_buffer_kits": 8,
+    "resupply_in_transit": 0,
+    "temp_excursion_count": 1,
+    "unresolved_excursion": 0,
+    "median_rand_to_dose_days": 4.2
+  },
+  {
+    "site_id": "SITE-114",
+    "study_id": "NCT-SYN-0412",
+    "available_kits": 9,
+    "min_buffer_kits": 8,
+    "resupply_in_transit": 0,
+    "temp_excursion_count": 0,
+    "unresolved_excursion": 0,
+    "median_rand_to_dose_days": 5.3
+  },
+  {
+    "site_id": "SITE-115",
+    "study_id": "NCT-SYN-0412",
+    "available_kits": 12,
+    "min_buffer_kits": 8,
+    "resupply_in_transit": 1,
+    "temp_excursion_count": 0,
+    "unresolved_excursion": 0,
+    "median_rand_to_dose_days": 3.4
+  },
+  {
+    "site_id": "SITE-116",
+    "study_id": "NCT-SYN-0412",
+    "available_kits": 19,
+    "min_buffer_kits": 8,
+    "resupply_in_transit": 1,
+    "temp_excursion_count": 0,
+    "unresolved_excursion": 0,
+    "median_rand_to_dose_days": 2.0
+  }
+]

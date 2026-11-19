@@ -1,0 +1,232 @@
+"""Unit tests for ingestion validation, PII guardrails, trial selection, signals, and SQL safety."""
+
+from __future__ import annotations
+
+from pathlib import Path
+import shutil
+import tempfile
+import unittest
+
+from scripts import (
+    ClinicalRangeValidationError,
+    EntityNotFoundError,
+    MalformedRecordError,
+    MissingDataSourceError,
+    PIIComplianceViolationError,
+    SQLSafetyError,
+    StateFileError,
+)
+from scripts.action_drafter import load_feedback_state, record_signal_feedback
+from scripts.analytics_assistant import answer_analytics_question, validate_readonly_sql
+from scripts.data_ingestor import PIIGuardrailScanner, ingest_workspace_data
+from scripts.generate_synthetic_data import generate_all_synthetic_data
+from scripts.signal_engine import SIGNAL_FAMILIES, evaluate_signals_and_sites, load_signal_rules
+from scripts.trial_selector import run_trial_selection
+
+
+class TestPIIGuardrails(unittest.TestCase):
+    """Verify HCLS and HIPAA Safe Harbor compliance scanner."""
+
+    def test_clean_synthetic_record_passes(self) -> None:
+        clean = {
+            "patient_id": "PAT-10001",
+            "age_years": 64,
+            "contact": "site-101@synthetic-clinical.example",
+            "primary_icd10": "C34.1",
+        }
+        self.assertEqual(PIIGuardrailScanner.scan_record("ehr.csv", "PAT-10001", clean), [])
+
+    def test_ssn_phone_email_and_age_over_89_detected(self) -> None:
+        dirty = {
+            "patient_id": "PAT-99999",
+            "age_years": 92,
+            "notes": "SSN 123-45-6789 or call (415) 555-0199 or user@gmail.com",
+            "patient_name": "Forbidden Field",
+        }
+        violations = PIIGuardrailScanner.scan_record("ehr.csv", "PAT-99999", dirty)
+        self.assertGreaterEqual(len(violations), 4)
+        joined = " | ".join(violations)
+        self.assertIn("Safe Harbor", joined)
+        self.assertIn("SSN", joined)
+        self.assertIn("telephone", joined)
+        self.assertIn("gmail.com", joined)
+        self.assertIn("patient_name", joined)
+
+
+class TestIngestionEdgeCases(unittest.TestCase):
+    """Verify strict vs quarantine behavior on corrupted, missing, or out-of-range inputs."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.data_dir = Path(self.tmp.name) / "data"
+        generate_all_synthetic_data(output_dir=self.data_dir, seed=42)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_missing_file_raises_missing_data_source_error(self) -> None:
+        (self.data_dir / "safety_sae_events.csv").unlink()
+        with self.assertRaises(MissingDataSourceError):
+            ingest_workspace_data(data_dir=self.data_dir, strict=True)
+
+    def test_corrupted_ndjson_strict_and_quarantine_modes(self) -> None:
+        pd_path = self.data_dir / "edc_protocol_deviations.ndjson"
+        with pd_path.open("a", encoding="utf-8") as handle:
+            handle.write("{corrupted_json_line\n")
+
+        with self.assertRaises(MalformedRecordError):
+            ingest_workspace_data(data_dir=self.data_dir, strict=True)
+
+        conn, report = ingest_workspace_data(data_dir=self.data_dir, strict=False)
+        try:
+            self.assertEqual(report.quarantined_records, 1)
+            q_rows = conn.execute("SELECT * FROM validation_quarantine").fetchall()
+            self.assertEqual(len(q_rows), 1)
+            self.assertEqual(q_rows[0]["error_type"], "MALFORMED_NDJSON")
+        finally:
+            conn.close()
+
+    def test_pii_and_physiological_bounds_handling(self) -> None:
+        pat_path = self.data_dir / "ehr_patients.csv"
+        with pat_path.open("a", encoding="utf-8") as handle:
+            handle.write("PAT-99901,94,M,NA,SITE-101,C34.1,Stage IV,1,1,30,NONE,1,50.0\n")
+
+        with self.assertRaises(PIIComplianceViolationError):
+            ingest_workspace_data(data_dir=self.data_dir, strict=True)
+
+        # Remove PII row and inject impossible negative lab value instead
+        shutil.rmtree(self.data_dir)
+        generate_all_synthetic_data(output_dir=self.data_dir, seed=42)
+        lab_path = self.data_dir / "lab_biomarkers.csv"
+        text = lab_path.read_text(encoding="utf-8").splitlines()
+        # Replace first data row eGFR with -15.0
+        parts = text[1].split(",")
+        parts[2] = "-15.0"
+        text[1] = ",".join(parts)
+        lab_path.write_text("\n".join(text) + "\n", encoding="utf-8")
+
+        with self.assertRaises(ClinicalRangeValidationError):
+            ingest_workspace_data(data_dir=self.data_dir, strict=True)
+
+        conn, report = ingest_workspace_data(data_dir=self.data_dir, strict=False)
+        try:
+            self.assertEqual(report.quarantined_records, 1)
+            row = conn.execute(
+                "SELECT egfr_ml_min FROM patient_labs WHERE patient_id = ?", (parts[0],)
+            ).fetchone()
+            self.assertIsNone(row["egfr_ml_min"])
+        finally:
+            conn.close()
+
+
+class TestTrialSelectionAndSignalEngines(unittest.TestCase):
+    """Verify patient eligibility classifications, site disqualifications, and 32 signal rules."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.conn, cls.report = ingest_workspace_data(strict=True)
+        cls.prelim_sel = run_trial_selection(cls.conn, persist_table=True)
+        cls.sig_bundle = evaluate_signals_and_sites(cls.conn)
+        risk_map = {s["site_id"]: s["risk_score"] for s in cls.sig_bundle["sites"]}
+        cls.sel_bundle = run_trial_selection(
+            cls.conn, site_risk_scores=risk_map, persist_table=True
+        )
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.conn.close()
+
+    def test_all_32_rules_and_7_families_configured(self) -> None:
+        cfg = load_signal_rules()
+        self.assertEqual(len(cfg["rules"]), 32)
+        families_in_cfg = {r["family"] for r in cfg["rules"]}
+        self.assertEqual(families_in_cfg, set(SIGNAL_FAMILIES))
+        triggered_families = {s["family"] for s in self.sig_bundle["signals"]}
+        self.assertEqual(triggered_families, set(SIGNAL_FAMILIES))
+
+    def test_three_priority_tiers_populated(self) -> None:
+        tiers = self.sig_bundle["tier_counts"]
+        self.assertGreater(tiers["Priority Action Required"], 0)
+        self.assertGreater(tiers["Important Signals Next"], 0)
+        self.assertGreater(tiers["Continue to Monitor"], 0)
+        self.assertEqual(sum(tiers.values()), 16)
+
+    def test_eligibility_classifications_and_site_safety_blocks(self) -> None:
+        patients = self.sel_bundle["patients"]
+        statuses = {p["primary_classification"] for p in patients}
+        self.assertEqual(statuses, {"ELIGIBLE", "POTENTIAL_NEEDS_LABS", "INELIGIBLE"})
+
+        for p in patients:
+            if p["primary_classification"] == "ELIGIBLE":
+                self.assertGreaterEqual(p["primary_match_score"], 85)
+                # Paused SITE-109 and cold-chain excursion SITE-105 must never receive referrals
+                self.assertNotIn(p["recommended_site_id"], ("SITE-105", "SITE-109"))
+            elif p["primary_classification"] == "INELIGIBLE":
+                self.assertLessEqual(p["primary_match_score"], 49)
+
+    def test_unknown_study_raises_entity_not_found(self) -> None:
+        with self.assertRaises(EntityNotFoundError):
+            run_trial_selection(self.conn, study_id="NCT-DOES-NOT-EXIST", persist_table=False)
+
+
+class TestSQLSandboxingAndFeedbackState(unittest.TestCase):
+    """Verify two-layer read-only SQLite guardrails and HITL feedback recovery."""
+
+    def setUp(self) -> None:
+        self.conn, _ = ingest_workspace_data(strict=True)
+        run_trial_selection(self.conn, persist_table=True)
+        evaluate_signals_and_sites(self.conn)
+
+    def tearDown(self) -> None:
+        self.conn.close()
+
+    def test_destructive_and_injected_sql_blocked(self) -> None:
+        unsafe_queries = [
+            "DROP TABLE studies",
+            "DELETE FROM sites WHERE site_id = 'SITE-101'",
+            "UPDATE sites SET enrolled_count = 999",
+            "INSERT INTO studies VALUES ('X','X','X','X','X',1,'v1',7,28)",
+            "SELECT * FROM studies; DROP TABLE sites",
+            "SELECT * FROM studies -- inline comment",
+            "PRAGMA writable_schema = 1",
+            "ATTACH DATABASE ':memory:' AS aux",
+        ]
+        for bad_sql in unsafe_queries:
+            with self.assertRaises(SQLSafetyError, msg=f"Failed to block: {bad_sql}"):
+                validate_readonly_sql(bad_sql)
+            with self.assertRaises(SQLSafetyError):
+                answer_analytics_question(self.conn, custom_sql=bad_sql)
+
+    def test_valid_nl_and_custom_select_queries_succeed(self) -> None:
+        res_nl = answer_analytics_question(
+            self.conn, question="Compare SAE reporting cycle times across studies"
+        )
+        self.assertEqual(res_nl["intent_id"], "SAE_CYCLE_TIME_BY_STUDY")
+        self.assertEqual(len(res_nl["rows"]), 4)
+        self.assertIn("SELECT", res_nl["sql"])
+
+        res_sql = answer_analytics_question(
+            self.conn,
+            custom_sql="SELECT study_id, protocol_code FROM studies ORDER BY study_id",
+        )
+        self.assertEqual(len(res_sql["rows"]), 4)
+
+    def test_corrupted_feedback_state_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            state_path.write_text("{not_valid_json", encoding="utf-8")
+            with self.assertRaises(StateFileError):
+                load_feedback_state(state_path, strict=True)
+            recovered = load_feedback_state(state_path, strict=False)
+            self.assertEqual(recovered, {})
+
+            saved = record_signal_feedback(
+                "SIG-1001", "ACCEPT", note="Verified with PI", state_file=state_path
+            )
+            self.assertEqual(saved["disposition"], "ACCEPT")
+            reloaded = load_feedback_state(state_path, strict=True)
+            self.assertEqual(reloaded["SIG-1001"]["note"], "Verified with PI")
+
+
+if __name__ == "__main__":
+    unittest.main()

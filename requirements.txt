@@ -1,0 +1,6 @@
+# Core runtime scripts in scripts/ use only the Python 3.10+ standard library
+# (sqlite3, csv, json, http.server, argparse, dataclasses, pathlib, logging)
+# to guarantee portable execution in restricted enterprise agent sandboxes.
+#
+# External dependency required for running the automated CLI test suite:
+pytest>=8.0.0
