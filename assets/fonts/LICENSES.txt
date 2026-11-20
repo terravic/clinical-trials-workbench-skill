@@ -1,0 +1,22 @@
+Self-Hosted Font License Attributions (SIL Open Font License, Version 1.1)
+
+All WOFF2 font files in this directory are self-hosted locally to eliminate external
+network dependencies and third-party font requests. Each typeface is distributed
+under the SIL Open Font License, Version 1.1 (OFL-1.1):
+
+1. DM Sans (dm-sans-400.woff2, dm-sans-500.woff2, dm-sans-600.woff2, dm-sans-700.woff2)
+   Copyright 2014 The DM Sans Project Authors (Colophon Foundry)
+   License: SIL Open Font License 1.1 (https://scripts.sil.org/OFL)
+
+2. IBM Plex Mono (ibm-plex-mono-400.woff2, ibm-plex-mono-500.woff2, ibm-plex-mono-600.woff2)
+   Copyright 2017 IBM Corp.
+   License: SIL Open Font License 1.1 (https://scripts.sil.org/OFL)
+
+3. Instrument Serif (instrument-serif-400.woff2, instrument-serif-400-italic.woff2)
+   Copyright 2022 The Instrument Serif Project Authors
+   License: SIL Open Font License 1.1 (https://scripts.sil.org/OFL)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of the
+Font Software, to use, study, copy, merge, embed, modify, redistribute, and sell
+modified and unmodified copies of the Font Software, subject to the conditions of
+the SIL Open Font License, Version 1.1.

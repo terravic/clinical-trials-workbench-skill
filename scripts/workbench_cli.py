@@ -10,20 +10,26 @@ Server-Sent Events (SSE) streaming.
 from __future__ import annotations
 
 import argparse
+import hmac
+import html as html_lib
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
 import queue
 import sys
 import threading
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts import (
     DEFAULT_DASHBOARD_PATH,
+    DEFAULT_FONTS_DIR,
+    DEFAULT_LEGAL_DIR,
     EntityNotFoundError,
     SQLSafetyError,
     WorkbenchError,
@@ -31,9 +37,11 @@ from scripts import (
 )
 from scripts.action_drafter import (
     build_portfolio_executive_briefing,
+    delete_reviewer_data,
     draft_issue_payload,
     draft_monitoring_visit_agenda,
     draft_site_followup_email,
+    export_reviewer_data,
     load_feedback_state,
     record_signal_feedback,
 )
@@ -43,6 +51,104 @@ from scripts.data_ingestor import ingest_workspace_data
 from scripts.generate_synthetic_data import generate_all_synthetic_data
 from scripts.signal_engine import evaluate_signals_and_sites, get_signal_by_id
 from scripts.trial_selector import run_trial_selection
+
+MAX_REQUEST_BODY_BYTES = 65_536
+MAX_SSE_SUBSCRIBERS = 32
+MAX_QUESTION_LENGTH = 1000
+MAX_SQL_PAYLOAD_LENGTH = 4096
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+ALLOWED_FONT_FILES = frozenset(
+    {
+        "dm-sans-400.woff2",
+        "dm-sans-500.woff2",
+        "dm-sans-600.woff2",
+        "dm-sans-700.woff2",
+        "ibm-plex-mono-400.woff2",
+        "ibm-plex-mono-500.woff2",
+        "ibm-plex-mono-600.woff2",
+        "instrument-serif-400.woff2",
+        "instrument-serif-400-italic.woff2",
+    }
+)
+
+LEGAL_ROUTE_FILES: dict[str, tuple[str, str]] = {
+    "/privacy": ("Privacy Notice", "privacy.md"),
+    "/terms": ("Terms of Service", "terms.md"),
+    "/refunds": ("Refund and Cancellation Policy", "refunds.md"),
+    "/cookies": ("Cookie and Local Storage Notice", "cookies.md"),
+}
+
+CONTENT_SECURITY_POLICY = (
+    "default-src 'self'; "
+    "script-src 'self' 'unsafe-inline'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "font-src 'self' data:; "
+    "img-src 'self' data:; "
+    "connect-src 'self'; "
+    "object-src 'none'; "
+    "base-uri 'none'; "
+    "frame-ancestors 'none'; "
+    "form-action 'self'"
+)
+
+
+def _render_legal_html(title: str, markdown_body: str) -> bytes:
+    """Render a draft legal markdown file as an accessible, CSP-safe HTML page."""
+    escaped_title = html_lib.escape(title)
+    escaped_body = html_lib.escape(markdown_body)
+    doc = (
+        "<!DOCTYPE html>\n"
+        '<html lang="en">\n'
+        "<head>\n"
+        '  <meta charset="UTF-8" />\n'
+        '  <meta name="viewport" content="width=device-width, initial-scale=1.0" />\n'
+        f"  <title>{escaped_title} - Clinical Trials Workbench</title>\n"
+        "  <style>\n"
+        "    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; "
+        "background: #FAFAF9; color: #1C1917; max-width: 860px; margin: 0 auto; padding: 24px; line-height: 1.6; }\n"
+        "    header { border-bottom: 1px solid #E7E5E4; padding-bottom: 12px; margin-bottom: 20px; }\n"
+        "    a { color: #0F766E; }\n"
+        "    a:focus-visible { outline: 2px solid #0F766E; outline-offset: 2px; }\n"
+        "    pre { white-space: pre-wrap; word-break: break-word; background: #FFFFFF; "
+        "border: 1px solid #E7E5E4; border-radius: 6px; padding: 18px; font-family: ui-monospace, monospace; font-size: 13px; }\n"
+        "    footer { margin-top: 24px; padding-top: 12px; border-top: 1px solid #E7E5E4; font-size: 12px; color: #57534E; }\n"
+        "  </style>\n"
+        "</head>\n"
+        "<body>\n"
+        "  <header>\n"
+        f"    <h1>{escaped_title}</h1>\n"
+        '    <nav aria-label="Legal Navigation">'
+        '<a href="/">Back to Workbench</a> | '
+        '<a href="/privacy">Privacy</a> | '
+        '<a href="/terms">Terms</a> | '
+        '<a href="/refunds">Refunds</a> | '
+        '<a href="/cookies">Cookies</a>'
+        "</nav>\n"
+        "  </header>\n"
+        "  <main>\n"
+        f"    <pre>{escaped_body}</pre>\n"
+        "  </main>\n"
+        "  <footer>DRAFT — REQUIRES LEGAL REVIEW</footer>\n"
+        "</body>\n"
+        "</html>\n"
+    )
+    return doc.encode("utf-8")
+
+
+def _validate_exact_keys(
+    payload: dict[str, Any],
+    allowed_keys: frozenset[str],
+    required_keys: frozenset[str] = frozenset(),
+) -> str | None:
+    """Validate that a JSON object contains only allowlisted keys and all required keys."""
+    unknown = sorted(set(payload.keys()) - allowed_keys)
+    if unknown:
+        return f"Undefined payload keys rejected: {', '.join(unknown)}"
+    missing = sorted(required_keys - set(payload.keys()))
+    if missing:
+        return f"Missing required payload keys: {', '.join(missing)}"
+    return None
 
 
 def _prepare_runtime_context(
@@ -146,10 +252,30 @@ def create_workbench_http_server(
     dashboard_path: Path,
     data_dir: str | None = None,
     state_file: str | None = None,
+    api_token: str | None = None,
+    authenticated_reviewer: str | None = None,
 ) -> ThreadingHTTPServer:
-    """Create a thread-safe local HTTP + Server-Sent Events (SSE) workbench server."""
+    """Create a hardened, thread-safe local HTTP + Server-Sent Events (SSE) workbench server."""
+    effective_token = api_token if api_token is not None else os.environ.get("CTW_API_TOKEN")
+    effective_reviewer = (
+        authenticated_reviewer
+        if authenticated_reviewer is not None
+        else os.environ.get("CTW_AUTHENTICATED_REVIEWER")
+    )
+    if host.lower() not in LOOPBACK_HOSTS and not effective_token:
+        raise ValueError(
+            "Binding to a non-loopback host requires CTW_API_TOKEN to be configured."
+        )
+
+    allowed_hosts = (
+        set(LOOPBACK_HOSTS) | {host.lower()}
+        if host.lower() in LOOPBACK_HOSTS
+        else {host.lower()}
+    )
+
     subscribers: list[queue.Queue[str]] = []
     sub_lock = threading.Lock()
+    state_lock = threading.Lock()
 
     def broadcast_update() -> None:
         bundle = compile_workspace_bundle(data_dir=data_dir, state_file=state_file)
@@ -165,21 +291,135 @@ def create_workbench_http_server(
         def log_message(self, fmt: str, *args: Any) -> None:
             return  # Keep terminal output quiet unless structured logger enabled
 
+        def _send_security_headers(self) -> None:
+            self.send_header("Content-Security-Policy", CONTENT_SECURITY_POLICY)
+            self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+            self.send_header("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+
         def _send_json(self, status: int, data: dict[str, Any]) -> None:
             body = json.dumps(data).encode("utf-8")
             self.send_response(status)
+            self._send_security_headers()
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+
+        def _validate_host_and_origin(self) -> bool:
+            raw_host = (self.headers.get("Host") or "").strip()
+            if raw_host:
+                if raw_host.startswith("["):
+                    host_only = raw_host.split("]")[0].lstrip("[").lower()
+                else:
+                    host_only = raw_host.split(":")[0].lower()
+                if host_only not in allowed_hosts:
+                    self._send_json(HTTPStatus.FORBIDDEN, {"error": "Invalid Host header"})
+                    return False
+
+            raw_origin = (self.headers.get("Origin") or "").strip()
+            if raw_origin:
+                parsed_origin = urlsplit(raw_origin)
+                origin_host = (parsed_origin.hostname or "").lower()
+                bound_port = self.server.server_address[1]
+                origin_port = parsed_origin.port
+                if (
+                    parsed_origin.scheme not in ("http", "https")
+                    or origin_host not in allowed_hosts
+                    or (origin_port is not None and origin_port != bound_port)
+                ):
+                    self._send_json(HTTPStatus.FORBIDDEN, {"error": "Cross-origin request rejected"})
+                    return False
+            return True
+
+        def _check_bearer_auth(self, mandatory: bool = False) -> bool:
+            if not effective_token:
+                if mandatory:
+                    self._send_json(
+                        HTTPStatus.UNAUTHORIZED,
+                        {"error": "Authentication required: configure CTW_API_TOKEN"},
+                    )
+                    return False
+                return True
+            auth_header = (self.headers.get("Authorization") or "").strip()
+            if not auth_header:
+                self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "Missing Authorization header"})
+                return False
+            parts = auth_header.split(" ", 1)
+            if len(parts) != 2 or parts[0].lower() != "bearer":
+                self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "Invalid Authorization scheme"})
+                return False
+            if not hmac.compare_digest(parts[1].strip(), effective_token):
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": "Invalid authentication token"})
+                return False
+            return True
+
+        def _authorize_reviewer_owner(self, target_reviewer_id: str) -> bool:
+            if not self._check_bearer_auth(mandatory=True):
+                return False
+            owner = effective_reviewer or (self.headers.get("X-Authenticated-Reviewer") or "").strip()
+            if not owner:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": "Authenticated reviewer identity required"},
+                )
+                return False
+            if not hmac.compare_digest(owner, target_reviewer_id):
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"error": "Forbidden: cannot access another reviewer's records"},
+                )
+                return False
+            return True
+
+        def _read_json_body(self) -> dict[str, Any] | None:
+            raw_len = self.headers.get("Content-Length", "0")
+            try:
+                length = int(raw_len)
+            except ValueError:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Invalid Content-Length header"})
+                return None
+            if length < 0:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Negative Content-Length header"})
+                return None
+            if length > MAX_REQUEST_BODY_BYTES:
+                self._send_json(
+                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                    {"error": f"Request body exceeds {MAX_REQUEST_BODY_BYTES} byte limit"},
+                )
+                return None
+            raw_body = self.rfile.read(length).decode("utf-8", errors="strict") if length > 0 else "{}"
+            try:
+                parsed = json.loads(raw_body)
+            except json.JSONDecodeError:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Invalid JSON body"})
+                return None
+            if not isinstance(parsed, dict):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "JSON payload must be an object"})
+                return None
+            return parsed
 
         def do_GET(self) -> None:  # noqa: N802
-            if self.path in ("/", "/dashboard.html"):
+            if not self._validate_host_and_origin():
+                return
+            parsed = urlsplit(self.path)
+            route = parsed.path
+            query = parse_qs(parsed.query)
+
+            if route in ("/", "/dashboard.html"):
                 html_bytes = dashboard_path.read_bytes()
                 self.send_response(HTTPStatus.OK)
+                self._send_security_headers()
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(html_bytes)))
+                self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 try:
                     self.wfile.write(html_bytes)
@@ -187,23 +427,84 @@ def create_workbench_http_server(
                     pass
                 return
 
-            if self.path == "/api/bundle":
+            if route.startswith("/assets/fonts/"):
+                font_name = route[len("/assets/fonts/"):]
+                if font_name in ALLOWED_FONT_FILES:
+                    font_path = DEFAULT_FONTS_DIR / font_name
+                    if font_path.is_file():
+                        font_bytes = font_path.read_bytes()
+                        self.send_response(HTTPStatus.OK)
+                        self._send_security_headers()
+                        self.send_header("Content-Type", "font/woff2")
+                        self.send_header("Content-Length", str(len(font_bytes)))
+                        self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+                        self.end_headers()
+                        try:
+                            self.wfile.write(font_bytes)
+                        except (BrokenPipeError, ConnectionResetError, OSError):
+                            pass
+                        return
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "Endpoint not found"})
+                return
+
+            if route in LEGAL_ROUTE_FILES:
+                title, filename = LEGAL_ROUTE_FILES[route]
+                legal_path = DEFAULT_LEGAL_DIR / filename
+                if legal_path.is_file():
+                    body = _render_legal_html(title, legal_path.read_text(encoding="utf-8"))
+                    self.send_response(HTTPStatus.OK)
+                    self._send_security_headers()
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    try:
+                        self.wfile.write(body)
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        pass
+                    return
+
+            if route == "/api/bundle":
+                if not self._check_bearer_auth(mandatory=False):
+                    return
                 bundle = compile_workspace_bundle(data_dir=data_dir, state_file=state_file)
                 self._send_json(HTTPStatus.OK, bundle)
                 return
 
-            if self.path.startswith("/events"):
-                is_once = "once=1" in self.path
+            if route == "/api/user-data/export":
+                req_reviewer = (query.get("reviewer_id") or [""])[0].strip()
+                if not req_reviewer:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Missing reviewer_id query parameter"})
+                    return
+                if not self._authorize_reviewer_owner(req_reviewer):
+                    return
+                try:
+                    exported = export_reviewer_data(req_reviewer, state_file=state_file)
+                    self._send_json(HTTPStatus.OK, exported)
+                except ValueError as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+
+            if route == "/events":
+                if not self._check_bearer_auth(mandatory=False):
+                    return
+                is_once = (query.get("once") or [""])[0] == "1"
+                client_q: queue.Queue[str] = queue.Queue(maxsize=8)
+                with sub_lock:
+                    if len(subscribers) >= MAX_SSE_SUBSCRIBERS:
+                        self._send_json(
+                            HTTPStatus.SERVICE_UNAVAILABLE,
+                            {"error": "Maximum concurrent event streams reached"},
+                        )
+                        return
+                    subscribers.append(client_q)
                 self.send_response(HTTPStatus.OK)
+                self._send_security_headers()
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Connection", "close" if is_once else "keep-alive")
                 self.end_headers()
-                client_q: queue.Queue[str] = queue.Queue(maxsize=8)
-                with sub_lock:
-                    subscribers.append(client_q)
                 try:
-                    # Emit initial heartbeat event immediately
                     self.wfile.write(b"event: connected\ndata: {\"status\":\"ok\"}\n\n")
                     self.wfile.flush()
                     if is_once:
@@ -226,24 +527,37 @@ def create_workbench_http_server(
                             subscribers.remove(client_q)
                 return
 
-            self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Unknown endpoint: {self.path}"})
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Endpoint not found"})
 
         def do_POST(self) -> None:  # noqa: N802
-            length = int(self.headers.get("Content-Length", "0"))
-            raw_body = self.rfile.read(length).decode("utf-8") if length > 0 else "{}"
-            try:
-                req = json.loads(raw_body)
-            except json.JSONDecodeError:
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Invalid JSON body"})
+            if not self._validate_host_and_origin():
                 return
+            route = urlsplit(self.path).path
 
-            if self.path == "/api/ask":
+            if route == "/api/ask":
+                if not self._check_bearer_auth(mandatory=False):
+                    return
+                req = self._read_json_body()
+                if req is None:
+                    return
+                schema_err = _validate_exact_keys(req, frozenset({"question", "sql"}))
+                if schema_err:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": schema_err})
+                    return
+                question = req.get("question")
+                custom_sql = req.get("sql")
+                if question is not None and (not isinstance(question, str) or len(question) > MAX_QUESTION_LENGTH):
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Invalid 'question' field"})
+                    return
+                if custom_sql is not None and (not isinstance(custom_sql, str) or len(custom_sql) > MAX_SQL_PAYLOAD_LENGTH):
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Invalid 'sql' field"})
+                    return
                 conn, _, _ = _prepare_runtime_context(data_dir, state_file, strict=False)
                 try:
                     ans = answer_analytics_question(
                         conn,
-                        question=req.get("question"),
-                        custom_sql=req.get("sql"),
+                        question=question,
+                        custom_sql=custom_sql,
                     )
                     self._send_json(HTTPStatus.OK, ans)
                 except (SQLSafetyError, ValueError) as exc:
@@ -252,27 +566,87 @@ def create_workbench_http_server(
                     conn.close()
                 return
 
-            if self.path == "/api/feedback":
+            if route == "/api/feedback":
+                if not self._check_bearer_auth(mandatory=False):
+                    return
+                req = self._read_json_body()
+                if req is None:
+                    return
+                schema_err = _validate_exact_keys(
+                    req,
+                    allowed_keys=frozenset({"signal_id", "disposition", "note", "reviewer_id"}),
+                    required_keys=frozenset({"signal_id", "disposition"}),
+                )
+                if schema_err:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": schema_err})
+                    return
+                for field_name in ("signal_id", "disposition", "note", "reviewer_id"):
+                    if field_name in req and not isinstance(req[field_name], str):
+                        self._send_json(
+                            HTTPStatus.BAD_REQUEST,
+                            {"error": f"Field '{field_name}' must be a string"},
+                        )
+                        return
+                target_reviewer = req.get("reviewer_id", "CRA-01")
+                if effective_reviewer and not hmac.compare_digest(effective_reviewer, target_reviewer):
+                    self._send_json(
+                        HTTPStatus.FORBIDDEN,
+                        {"error": "Forbidden: reviewer_id does not match authenticated reviewer"},
+                    )
+                    return
                 try:
-                    entry = record_signal_feedback(
-                        signal_id=str(req["signal_id"]),
-                        disposition=str(req["disposition"]),
-                        note=str(req.get("note", "")),
-                        reviewer_id=str(req.get("reviewer_id", "CRA-01")),
-                        state_file=state_file,
-                    )
-                    build_standalone_dashboard(
-                        output_path=dashboard_path,
-                        data_dir=data_dir,
-                        state_file=state_file,
-                    )
+                    with state_lock:
+                        entry = record_signal_feedback(
+                            signal_id=req["signal_id"],
+                            disposition=req["disposition"],
+                            note=req.get("note", ""),
+                            reviewer_id=target_reviewer,
+                            state_file=state_file,
+                        )
+                        build_standalone_dashboard(
+                            output_path=dashboard_path,
+                            data_dir=data_dir,
+                            state_file=state_file,
+                        )
                     broadcast_update()
                     self._send_json(HTTPStatus.OK, {"status": "saved", "feedback": entry})
                 except (KeyError, ValueError) as exc:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
 
-            self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Unknown POST route: {self.path}"})
+            if route == "/api/user-data/delete":
+                req = self._read_json_body()
+                if req is None:
+                    return
+                schema_err = _validate_exact_keys(
+                    req,
+                    allowed_keys=frozenset({"reviewer_id"}),
+                    required_keys=frozenset({"reviewer_id"}),
+                )
+                if schema_err or not isinstance(req.get("reviewer_id"), str):
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {"error": schema_err or "Field 'reviewer_id' must be a string"},
+                    )
+                    return
+                target_reviewer = req["reviewer_id"].strip()
+                if not self._authorize_reviewer_owner(target_reviewer):
+                    return
+                try:
+                    with state_lock:
+                        deletion = delete_reviewer_data(target_reviewer, state_file=state_file)
+                        build_standalone_dashboard(
+                            output_path=dashboard_path,
+                            data_dir=data_dir,
+                            state_file=state_file,
+                        )
+                    broadcast_update()
+                    self._send_json(HTTPStatus.OK, {"status": "deleted", **deletion})
+                except ValueError as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Endpoint not found"})
 
     return ThreadingHTTPServer((host, port), WorkbenchRequestHandler)
 

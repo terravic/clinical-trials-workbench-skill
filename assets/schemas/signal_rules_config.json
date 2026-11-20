@@ -175,7 +175,7 @@
       "operator": "==",
       "threshold": "INCOMPLETE",
       "rationale_template": "Staff training module {record_id} ({extra}) remains INCOMPLETE, delaying backup coordinator system provisioning.",
-      "recommended_action": "Follow up with backup study coordinator to complete LMS module and unlock EDC/IRT role access."
+      "recommended_action": "Follow up with backup study coordinator to complete LMS module and provision EDC/IRT role access."
     },
     {
       "rule_id": "SR-EDC-01",

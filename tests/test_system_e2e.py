@@ -25,12 +25,17 @@ EMOJI_REGEX = re.compile(
     "]"
 )
 
-INTERNAL_LEAK_PATTERNS = (
-    "corp.google.com",
-    "http://go/",
-    "https://go/",
-    "//google3/",
-    "file:///google3",
+EXTERNAL_FONT_PATTERNS = (
+    "fonts.googleapis.com",
+    "fonts.gstatic.com",
+)
+
+LOCAL_PATH_REGEX = re.compile(
+    r"(?:^|[\s\"'`(])(?:/" + "Users" + r"/|/" + "home" + r"/|[A-Za-z]:\\)"
+)
+
+SECRET_TOKEN_REGEX = re.compile(
+    r"(sk-[A-Za-z0-9]{20,}|AIza[0-9A-Za-z\-_]{30,}|ya29\.[0-9A-Za-z\-_]{20,}|ghp_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY)"
 )
 
 AI_BOILERPLATE_PHRASES = (
@@ -41,7 +46,7 @@ AI_BOILERPLATE_PHRASES = (
 
 
 class TestEndToEndSystem(unittest.TestCase):
-    """Execute full CLI workflow, DESIGN.md UI verification, SSE HTTP endpoints, and repo hygiene."""
+    """Execute full CLI workflow, DESIGN.md UI verification, SSE HTTP endpoints, security, and hygiene."""
 
     def test_full_cli_pipeline_and_design_md_verification(self) -> None:
         cli = str(PROJECT_ROOT / "scripts" / "workbench_cli.py")
@@ -187,9 +192,21 @@ class TestEndToEndSystem(unittest.TestCase):
             for viz_hex in ("#0D9488", "#D97706", "#4F46E5", "#059669", "#E11D48"):
                 self.assertIn(viz_hex, html)
 
-            # Verify typography pairing and HTML5 Canvas elements
+            # Verify self-hosted typography pairing, zero remote font hosts, and 2D/3D plot elements
             for font_name in ("DM Sans", "Instrument Serif", "IBM Plex Mono"):
                 self.assertIn(font_name, html)
+            self.assertIn("@font-face", html)
+            self.assertIn("assets/fonts/dm-sans-400.woff2", html)
+            for ext_host in EXTERNAL_FONT_PATTERNS:
+                self.assertNotIn(ext_host, html)
+
+            # Verify CSP meta policy and WCAG 2.2 AA structural landmarks
+            self.assertIn('http-equiv="Content-Security-Policy"', html)
+            self.assertIn('class="skip-link"', html)
+            self.assertIn('<footer class="site-footer">', html)
+            self.assertIn('<h2 class="pane-title">', html)
+            self.assertIn(":focus-visible", html)
+
             for canvas_id in (
                 "canvas-heatmap",
                 "canvas-sae-trend",
@@ -251,8 +268,29 @@ class TestEndToEndSystem(unittest.TestCase):
                 with urlopen(f"{base_url}/", timeout=5) as resp:
                     self.assertEqual(resp.status, 200)
                     self.assertIn("text/html", resp.headers.get("Content-Type", ""))
+                    self.assertEqual(resp.headers.get("X-Content-Type-Options"), "nosniff")
+                    self.assertEqual(resp.headers.get("X-Frame-Options"), "DENY")
+                    self.assertIn("default-src 'self'", resp.headers.get("Content-Security-Policy", ""))
+                    self.assertIn("max-age=", resp.headers.get("Strict-Transport-Security", ""))
                     html_resp = resp.read().decode("utf-8")
                     self.assertIn("<h1>Clinical Trials Workbench</h1>", html_resp)
+
+                # GET self-hosted font file & reject path traversal
+                with urlopen(f"{base_url}/assets/fonts/dm-sans-400.woff2", timeout=5) as resp:
+                    self.assertEqual(resp.status, 200)
+                    self.assertEqual(resp.headers.get("Content-Type"), "font/woff2")
+                    self.assertEqual(resp.read(4), b"wOF2")
+
+                with self.assertRaises(HTTPError) as ctx_trav:
+                    urlopen(f"{base_url}/assets/fonts/../../LICENSE", timeout=5)
+                self.assertEqual(ctx_trav.exception.code, 404)
+
+                # GET draft legal routes
+                for legal_route in ("/privacy", "/terms", "/refunds", "/cookies"):
+                    with urlopen(f"{base_url}{legal_route}", timeout=5) as resp:
+                        self.assertEqual(resp.status, 200)
+                        body = resp.read().decode("utf-8")
+                        self.assertIn("DRAFT — REQUIRES LEGAL REVIEW", body)
 
                 # GET /events?once=1 (SSE stream check)
                 with urlopen(f"{base_url}/events?once=1", timeout=5) as resp:
@@ -284,6 +322,17 @@ class TestEndToEndSystem(unittest.TestCase):
                     urlopen(req_bad, timeout=5)
                 self.assertEqual(ctx.exception.code, 400)
 
+                # POST /api/ask (undefined key must return 400)
+                req_extra = Request(
+                    f"{base_url}/api/ask",
+                    data=json.dumps({"question": "Compare SAE cycle times", "extra_key": True}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with self.assertRaises(HTTPError) as ctx_extra:
+                    urlopen(req_extra, timeout=5)
+                self.assertEqual(ctx_extra.exception.code, 400)
+
                 # POST /api/feedback
                 req_fb = Request(
                     f"{base_url}/api/feedback",
@@ -297,17 +346,149 @@ class TestEndToEndSystem(unittest.TestCase):
                     self.assertEqual(resp.status, 200)
                     fb_res = json.loads(resp.read().decode("utf-8"))
                     self.assertEqual(fb_res["feedback"]["disposition"], "MODIFY")
+
+                # Reject cross-origin POST with 403
+                req_xorigin = Request(
+                    f"{base_url}/api/feedback",
+                    data=json.dumps({"signal_id": "SIG-1002", "disposition": "ACCEPT"}).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Origin": "https://untrusted.example",
+                    },
+                    method="POST",
+                )
+                with self.assertRaises(HTTPError) as ctx_xo:
+                    urlopen(req_xorigin, timeout=5)
+                self.assertEqual(ctx_xo.exception.code, 403)
+
+                # Reject oversized payload with 413
+                req_big = Request(
+                    f"{base_url}/api/ask",
+                    data=(b" " * 70000),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with self.assertRaises(HTTPError) as ctx_big:
+                    urlopen(req_big, timeout=5)
+                self.assertEqual(ctx_big.exception.code, 413)
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_http_auth_owner_isolation_and_non_loopback_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            dash_file = tmp_path / "dashboard.html"
+            state_file = tmp_path / "state.json"
+            dash_file.write_text("<html><body>ok</body></html>", encoding="utf-8")
+
+            # Non-loopback host without token must fail closed
+            with self.assertRaises(ValueError):
+                create_workbench_http_server("0.0.0.0", 0, dash_file, state_file=str(state_file), api_token="")
+
+            server = create_workbench_http_server(
+                "127.0.0.1",
+                0,
+                dash_file,
+                state_file=str(state_file),
+                api_token="ephemeral-test-token",
+                authenticated_reviewer="CRA-01",
+            )
+            port = server.server_address[1]
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                base_url = f"http://127.0.0.1:{port}"
+                auth_headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer ephemeral-test-token",
+                }
+
+                # Unauthenticated API call returns 401
+                req_noauth = Request(
+                    f"{base_url}/api/feedback",
+                    data=json.dumps({"signal_id": "SIG-1001", "disposition": "ACCEPT"}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with self.assertRaises(HTTPError) as ctx_401:
+                    urlopen(req_noauth, timeout=5)
+                self.assertEqual(ctx_401.exception.code, 401)
+
+                # Invalid token returns 403
+                req_badtok = Request(
+                    f"{base_url}/api/feedback",
+                    data=json.dumps({"signal_id": "SIG-1001", "disposition": "ACCEPT"}).encode("utf-8"),
+                    headers={"Content-Type": "application/json", "Authorization": "Bearer wrong-token"},
+                    method="POST",
+                )
+                with self.assertRaises(HTTPError) as ctx_403:
+                    urlopen(req_badtok, timeout=5)
+                self.assertEqual(ctx_403.exception.code, 403)
+
+                # Authenticated CRA-01 records own feedback
+                req_own = Request(
+                    f"{base_url}/api/feedback",
+                    data=json.dumps(
+                        {"signal_id": "SIG-1001", "disposition": "ACCEPT", "reviewer_id": "CRA-01"}
+                    ).encode("utf-8"),
+                    headers=auth_headers,
+                    method="POST",
+                )
+                with urlopen(req_own, timeout=5) as resp:
+                    self.assertEqual(resp.status, 200)
+
+                # Non-owner attempt by CRA-01 to export or delete CRA-02 data returns 403
+                req_idor_exp = Request(
+                    f"{base_url}/api/user-data/export?reviewer_id=CRA-02",
+                    headers={"Authorization": "Bearer ephemeral-test-token"},
+                    method="GET",
+                )
+                with self.assertRaises(HTTPError) as ctx_idor1:
+                    urlopen(req_idor_exp, timeout=5)
+                self.assertEqual(ctx_idor1.exception.code, 403)
+
+                req_idor_del = Request(
+                    f"{base_url}/api/user-data/delete",
+                    data=json.dumps({"reviewer_id": "CRA-02"}).encode("utf-8"),
+                    headers=auth_headers,
+                    method="POST",
+                )
+                with self.assertRaises(HTTPError) as ctx_idor2:
+                    urlopen(req_idor_del, timeout=5)
+                self.assertEqual(ctx_idor2.exception.code, 403)
+
+                # Owner CRA-01 can export and permanently delete own records
+                req_exp = Request(
+                    f"{base_url}/api/user-data/export?reviewer_id=CRA-01",
+                    headers={"Authorization": "Bearer ephemeral-test-token"},
+                    method="GET",
+                )
+                with urlopen(req_exp, timeout=5) as resp:
+                    exp_data = json.loads(resp.read().decode("utf-8"))
+                    self.assertEqual(exp_data["record_count"], 1)
+
+                req_del = Request(
+                    f"{base_url}/api/user-data/delete",
+                    data=json.dumps({"reviewer_id": "CRA-01"}).encode("utf-8"),
+                    headers=auth_headers,
+                    method="POST",
+                )
+                with urlopen(req_del, timeout=5) as resp:
+                    del_data = json.loads(resp.read().decode("utf-8"))
+                    self.assertEqual(del_data["purged_count"], 1)
             finally:
                 server.shutdown()
                 server.server_close()
 
     def test_repository_hygiene_no_emojis_no_internal_links_no_ai_markers(self) -> None:
         skip_dirs = {".git", "__pycache__", ".pytest_cache", ".venv", "venv"}
+        binary_suffixes = {".pyc", ".pyo", ".png", ".jpg", ".sqlite", ".db", ".woff2"}
         checked_files = 0
         for path in PROJECT_ROOT.rglob("*"):
             if any(part in skip_dirs for part in path.parts) or not path.is_file():
                 continue
-            if path.suffix in {".pyc", ".pyo", ".png", ".jpg", ".sqlite", ".db"}:
+            if path.suffix in binary_suffixes:
                 continue
             text = path.read_text(encoding="utf-8")
             rel = path.relative_to(PROJECT_ROOT)
@@ -321,13 +502,21 @@ class TestEndToEndSystem(unittest.TestCase):
 
             lower = text.lower()
             if rel.as_posix() != "tests/test_system_e2e.py":
-                for leak in INTERNAL_LEAK_PATTERNS:
+                for ext_font in EXTERNAL_FONT_PATTERNS:
                     self.assertNotIn(
-                        leak, lower, f"Forbidden internal domain/link '{leak}' found in {rel}"
+                        ext_font, lower, f"External font host '{ext_font}' found in {rel}"
                     )
+                self.assertIsNone(
+                    LOCAL_PATH_REGEX.search(text),
+                    f"Local absolute path detected in {rel}",
+                )
+                self.assertIsNone(
+                    SECRET_TOKEN_REGEX.search(text),
+                    f"Possible secret signature found in {rel}",
+                )
                 for phrase in AI_BOILERPLATE_PHRASES:
                     self.assertNotIn(
-                        phrase, lower, f"Forbidden AI boilerplate '{phrase}' found in {rel}"
+                        phrase, lower, f"Forbidden boilerplate '{phrase}' found in {rel}"
                     )
         self.assertGreaterEqual(checked_files, 25)
 

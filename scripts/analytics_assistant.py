@@ -19,6 +19,18 @@ FORBIDDEN_SQL_TOKENS = re.compile(
     re.IGNORECASE,
 )
 
+MAX_SQL_LENGTH = 4096
+MAX_SQL_VM_OPCODES = 250_000
+PROGRESS_CHECK_INTERVAL = 5_000
+
+DISALLOWED_SQLITE_FUNCTIONS = frozenset(
+    {
+        "load_extension",
+        "randomblob",
+        "zeroblob",
+    }
+)
+
 ALLOWED_SQLITE_ACTIONS = frozenset(
     {
         sqlite3.SQLITE_SELECT,
@@ -35,9 +47,15 @@ def _readonly_authorizer(
     db_name: str | None,
     trigger_name: str | None,
 ) -> int:
-    if action_code in ALLOWED_SQLITE_ACTIONS:
-        return sqlite3.SQLITE_OK
-    return sqlite3.SQLITE_DENY
+    if action_code not in ALLOWED_SQLITE_ACTIONS:
+        return sqlite3.SQLITE_DENY
+    if action_code == sqlite3.SQLITE_FUNCTION and param2:
+        if param2.lower() in DISALLOWED_SQLITE_FUNCTIONS:
+            return sqlite3.SQLITE_DENY
+    if action_code == sqlite3.SQLITE_READ and param1:
+        if param1.lower().startswith("sqlite_"):
+            return sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_OK
 
 
 def validate_readonly_sql(sql: str) -> str:
@@ -45,6 +63,8 @@ def validate_readonly_sql(sql: str) -> str:
     cleaned = sql.strip()
     if not cleaned:
         raise SQLSafetyError("Empty SQL query is not permitted.")
+    if len(cleaned) > MAX_SQL_LENGTH:
+        raise SQLSafetyError(f"SQL query exceeds maximum allowed length ({MAX_SQL_LENGTH} characters).")
     if "--" in cleaned or "/*" in cleaned or "*/" in cleaned:
         raise SQLSafetyError("SQL comments are disallowed by security guardrails.")
     # Allow optional trailing semicolon, forbid internal semicolons (multi-statement)
@@ -63,20 +83,35 @@ def validate_readonly_sql(sql: str) -> str:
 def execute_guarded_sql(
     conn: sqlite3.Connection, sql: str, params: tuple[Any, ...] = (), max_rows: int = 200
 ) -> tuple[list[str], list[dict[str, Any]]]:
-    """Execute a validated read-only query under a strict SQLite authorizer."""
+    """Execute a validated read-only query under a strict SQLite authorizer and VM step budget."""
     safe_sql = validate_readonly_sql(sql)
+    opcode_ticks = 0
+
+    def _progress_guard() -> int:
+        nonlocal opcode_ticks
+        opcode_ticks += PROGRESS_CHECK_INTERVAL
+        return 1 if opcode_ticks > MAX_SQL_VM_OPCODES else 0
+
     conn.set_authorizer(_readonly_authorizer)
+    conn.set_progress_handler(_progress_guard, PROGRESS_CHECK_INTERVAL)
     try:
         cursor = conn.execute(safe_sql, params)
         col_names = [desc[0] for desc in (cursor.description or [])]
         fetched = cursor.fetchmany(max_rows)
         rows = [dict(zip(col_names, r)) for r in fetched]
         return col_names, rows
+    except sqlite3.OperationalError as exc:
+        if "interrupted" in str(exc).lower():
+            raise SQLSafetyError("SQL query aborted: exceeded read-only execution budget.") from exc
+        if "not authorized" in str(exc).lower():
+            raise SQLSafetyError(f"SQLite authorizer blocked non-read-only operation: {exc}") from exc
+        raise SQLSafetyError(f"SQL execution error: {exc}") from exc
     except sqlite3.DatabaseError as exc:
         if "not authorized" in str(exc).lower():
             raise SQLSafetyError(f"SQLite authorizer blocked non-read-only operation: {exc}") from exc
         raise SQLSafetyError(f"SQL execution error: {exc}") from exc
     finally:
+        conn.set_progress_handler(None, 0)
         conn.set_authorizer(None)
 
 

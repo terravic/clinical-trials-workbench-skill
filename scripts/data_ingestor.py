@@ -88,7 +88,7 @@ class PIIGuardrailScanner:
                         )
                 except ValueError:
                     violations.append(
-                        f"{source_name}[{record_id}]: non-numeric age_years='{raw_val}'"
+                        f"{source_name}[{record_id}]: non-numeric age_years=[REDACTED]"
                     )
 
             text = str(raw_val)

@@ -1,4 +1,4 @@
-"""Standalone Interactive HTML5 Canvas Dashboard Builder.
+"""Standalone Interactive 2D/3D Clinical Operations Dashboard Builder.
 
 Compiles empirical multi-source clinical trial selection, signal detection,
 human-in-the-loop drafting, analytics, and SHA-256 provenance data into a
@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 from typing import Any
 
 from scripts import DEFAULT_DASHBOARD_PATH, PROJECT_ROOT, configure_logging
@@ -146,12 +147,74 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self';" />
   <title>Clinical Trials Workbench</title>
-  <meta name="description" content="Enterprise Clinical Operations System of Action and Synthetic Patient Trial Eligibility Selection Workbench with interactive HTML5 Canvas analytics." />
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500;600&amp;family=Instrument+Serif:ital@0;1&amp;display=swap" rel="stylesheet" />
+  <meta name="description" content="Clinical Operations System of Action and Synthetic Patient Trial Eligibility Selection Workbench with interactive 2D and 3D analytics." />
   <style>
+    @font-face {
+      font-family: "DM Sans";
+      font-style: normal;
+      font-weight: 400;
+      font-display: swap;
+      src: url("assets/fonts/dm-sans-400.woff2") format("woff2");
+    }
+    @font-face {
+      font-family: "DM Sans";
+      font-style: normal;
+      font-weight: 500;
+      font-display: swap;
+      src: url("assets/fonts/dm-sans-500.woff2") format("woff2");
+    }
+    @font-face {
+      font-family: "DM Sans";
+      font-style: normal;
+      font-weight: 600;
+      font-display: swap;
+      src: url("assets/fonts/dm-sans-600.woff2") format("woff2");
+    }
+    @font-face {
+      font-family: "DM Sans";
+      font-style: normal;
+      font-weight: 700;
+      font-display: swap;
+      src: url("assets/fonts/dm-sans-700.woff2") format("woff2");
+    }
+    @font-face {
+      font-family: "IBM Plex Mono";
+      font-style: normal;
+      font-weight: 400;
+      font-display: swap;
+      src: url("assets/fonts/ibm-plex-mono-400.woff2") format("woff2");
+    }
+    @font-face {
+      font-family: "IBM Plex Mono";
+      font-style: normal;
+      font-weight: 500;
+      font-display: swap;
+      src: url("assets/fonts/ibm-plex-mono-500.woff2") format("woff2");
+    }
+    @font-face {
+      font-family: "IBM Plex Mono";
+      font-style: normal;
+      font-weight: 600;
+      font-display: swap;
+      src: url("assets/fonts/ibm-plex-mono-600.woff2") format("woff2");
+    }
+    @font-face {
+      font-family: "Instrument Serif";
+      font-style: normal;
+      font-weight: 400;
+      font-display: swap;
+      src: url("assets/fonts/instrument-serif-400.woff2") format("woff2");
+    }
+    @font-face {
+      font-family: "Instrument Serif";
+      font-style: italic;
+      font-weight: 400;
+      font-display: swap;
+      src: url("assets/fonts/instrument-serif-400-italic.woff2") format("woff2");
+    }
+
     :root,
     [data-theme="light"] {
       --bg-page: #FAFAF9;
@@ -160,7 +223,9 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       --border-color: #E7E5E4;
       --text-primary: #1C1917;
       --text-secondary: #787774;
+      --text-muted-aa: #57534E;
       --grid-line: #E7E5E4;
+      --focus-ring: #0F766E;
 
       --viz-teal: #0D9488;
       --viz-amber: #D97706;
@@ -168,11 +233,24 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       --viz-emerald: #059669;
       --viz-rose: #E11D48;
 
+      --btn-primary-bg: #0F766E;
+      --btn-primary-hover: #115E59;
+
+      --kpi-rose: #BE123C;
+      --kpi-amber: #B45309;
+      --kpi-teal: #0F766E;
+      --kpi-emerald: #047857;
+
       --badge-rose-bg: rgba(225, 29, 72, 0.10);
+      --badge-rose-fg: #9F1239;
       --badge-amber-bg: rgba(217, 119, 6, 0.12);
+      --badge-amber-fg: #92400E;
       --badge-emerald-bg: rgba(5, 150, 105, 0.11);
+      --badge-emerald-fg: #065F46;
       --badge-teal-bg: rgba(13, 148, 136, 0.11);
+      --badge-teal-fg: #115E59;
       --badge-indigo-bg: rgba(79, 70, 229, 0.11);
+      --badge-indigo-fg: #3730A3;
     }
 
     [data-theme="dark"] {
@@ -182,13 +260,28 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       --border-color: #292A30;
       --text-primary: #ECE8E2;
       --text-secondary: #9A9895;
+      --text-muted-aa: #B5B2AC;
       --grid-line: #292A30;
+      --focus-ring: #5EEAD4;
+
+      --btn-primary-bg: #0F766E;
+      --btn-primary-hover: #115E59;
+
+      --kpi-rose: #FB7185;
+      --kpi-amber: #FBBF24;
+      --kpi-teal: #2DD4BF;
+      --kpi-emerald: #34D399;
 
       --badge-rose-bg: rgba(225, 29, 72, 0.18);
+      --badge-rose-fg: #FDA4AF;
       --badge-amber-bg: rgba(217, 119, 6, 0.18);
+      --badge-amber-fg: #FCD34D;
       --badge-emerald-bg: rgba(5, 150, 105, 0.18);
+      --badge-emerald-fg: #6EE7B7;
       --badge-teal-bg: rgba(13, 148, 136, 0.18);
+      --badge-teal-fg: #5EEAD4;
       --badge-indigo-bg: rgba(79, 70, 229, 0.18);
+      --badge-indigo-fg: #C7D2FE;
     }
 
     * {
@@ -204,6 +297,36 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       font-size: 14px;
       line-height: 1.5;
       -webkit-font-smoothing: antialiased;
+    }
+
+    .skip-link {
+      position: absolute;
+      left: -9999px;
+      top: 0;
+      z-index: 100;
+      background-color: var(--btn-primary-bg);
+      color: #FFFFFF;
+      padding: 8px 14px;
+      font-weight: 600;
+      text-decoration: none;
+      border-radius: 0 0 6px 0;
+    }
+
+    .skip-link:focus {
+      left: 0;
+      outline: 2px solid var(--focus-ring);
+      outline-offset: 2px;
+    }
+
+    a:focus-visible,
+    button:focus-visible,
+    input:focus-visible,
+    select:focus-visible,
+    textarea:focus-visible,
+    th[tabindex]:focus-visible,
+    tr[tabindex]:focus-visible {
+      outline: 2px solid var(--focus-ring);
+      outline-offset: 2px;
     }
 
     .mono,
@@ -249,7 +372,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 
     .brand-subtitle {
       font-size: 12px;
-      color: var(--text-secondary);
+      color: var(--text-muted-aa);
       border-left: 1px solid var(--border-color);
       padding-left: 12px;
     }
@@ -266,7 +389,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       align-items: center;
       gap: 6px;
       font-size: 12px;
-      color: var(--text-secondary);
+      color: var(--text-muted-aa);
     }
 
     select,
@@ -280,14 +403,13 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       padding: 6px 10px;
       font-family: inherit;
       font-size: 13px;
-      outline: none;
       transition: border-color 0.15s ease;
     }
 
     select:focus,
     input:focus,
     textarea:focus {
-      border-color: var(--viz-teal);
+      border-color: var(--focus-ring);
     }
 
     button {
@@ -308,13 +430,14 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     }
 
     button.btn-primary {
-      background-color: var(--viz-teal);
-      border-color: var(--viz-teal);
+      background-color: var(--btn-primary-bg);
+      border-color: var(--btn-primary-bg);
       color: #FFFFFF;
     }
 
     button.btn-primary:hover {
-      opacity: 0.92;
+      background-color: var(--btn-primary-hover);
+      border-color: var(--btn-primary-hover);
     }
 
     /* Three-Icon Theme Selector (DESIGN.md Section 3) */
@@ -332,7 +455,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       border-radius: 0;
       padding: 6px 9px;
       background: transparent;
-      color: var(--text-secondary);
+      color: var(--text-muted-aa);
       display: inline-flex;
       align-items: center;
       justify-content: center;
@@ -375,7 +498,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       padding: 11px 14px;
       font-size: 13px;
       font-weight: 500;
-      color: var(--text-secondary);
+      color: var(--text-muted-aa);
       white-space: nowrap;
     }
 
@@ -386,7 +509,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 
     .view-tab.active {
       color: var(--text-primary);
-      border-bottom-color: var(--viz-teal);
+      border-bottom-color: var(--btn-primary-bg);
       font-weight: 600;
     }
 
@@ -394,7 +517,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     main.workspace {
       max-width: 1560px;
       margin: 0 auto;
-      padding: 20px 24px 40px;
+      padding: 20px 24px 32px;
     }
 
     .view-panel {
@@ -446,16 +569,18 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       flex-wrap: wrap;
     }
 
+    h2.pane-title,
     .pane-title {
       font-size: 14px;
       font-weight: 600;
       letter-spacing: -0.01em;
       color: var(--text-primary);
+      margin: 0;
     }
 
     .pane-meta {
       font-size: 12px;
-      color: var(--text-secondary);
+      color: var(--text-muted-aa);
     }
 
     /* KPI Strip Cells */
@@ -468,7 +593,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 
     .kpi-sub {
       font-size: 12px;
-      color: var(--text-secondary);
+      color: var(--text-muted-aa);
     }
 
     /* Status Badges */
@@ -478,7 +603,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       border-radius: 6px;
       font-family: "IBM Plex Mono", monospace;
       font-size: 11px;
-      font-weight: 500;
+      font-weight: 600;
       white-space: nowrap;
     }
 
@@ -486,36 +611,36 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     .badge-priority,
     .badge-ineligible {
       background-color: var(--badge-rose-bg);
-      color: var(--viz-rose);
+      color: var(--badge-rose-fg);
     }
 
     .badge-high,
     .badge-important,
     .badge-needs-labs {
       background-color: var(--badge-amber-bg);
-      color: var(--viz-amber);
+      color: var(--badge-amber-fg);
     }
 
     .badge-emerald,
     .badge-monitor,
     .badge-eligible {
       background-color: var(--badge-emerald-bg);
-      color: var(--viz-emerald);
+      color: var(--badge-emerald-fg);
     }
 
     .badge-teal {
       background-color: var(--badge-teal-bg);
-      color: var(--viz-teal);
+      color: var(--badge-teal-fg);
     }
 
     .badge-indigo {
       background-color: var(--badge-indigo-bg);
-      color: var(--viz-indigo);
+      color: var(--badge-indigo-fg);
     }
 
     .badge-muted {
       background-color: var(--bg-subtle);
-      color: var(--text-secondary);
+      color: var(--text-muted-aa);
     }
 
     /* Filter Bars */
@@ -552,13 +677,16 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       font-weight: 600;
       text-transform: uppercase;
       letter-spacing: 0.04em;
-      color: var(--text-secondary);
+      color: var(--text-muted-aa);
       background-color: var(--bg-surface);
       position: sticky;
       top: 0;
       z-index: 2;
-      cursor: pointer;
       user-select: none;
+    }
+
+    th[data-sort] {
+      cursor: pointer;
     }
 
     td.num,
@@ -570,6 +698,10 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       transition: background-color 0.1s ease;
     }
 
+    tbody tr[data-pat-row] {
+      cursor: pointer;
+    }
+
     tbody tr:hover {
       background-color: var(--bg-subtle);
     }
@@ -578,7 +710,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       background-color: var(--badge-teal-bg);
     }
 
-    /* Canvas Wrappers & Scientific Toolbars */
+    /* Plot Wrappers & Scientific Toolbars */
     .viz-toolbar {
       display: flex;
       align-items: center;
@@ -602,7 +734,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       border-radius: 6px;
       border: 1px solid var(--border-color);
       background-color: var(--bg-page);
-      color: var(--text-secondary);
+      color: var(--text-muted-aa);
     }
 
     .viz-chip:hover {
@@ -612,8 +744,8 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 
     .viz-chip.active {
       background-color: var(--badge-teal-bg);
-      border-color: var(--viz-teal);
-      color: var(--viz-teal);
+      border-color: var(--badge-teal-fg);
+      color: var(--badge-teal-fg);
       font-weight: 600;
     }
 
@@ -664,7 +796,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 
     .subtab-btn.active {
       background-color: var(--bg-subtle);
-      border-color: var(--text-secondary);
+      border-color: var(--text-muted-aa);
       font-weight: 600;
     }
 
@@ -691,7 +823,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 
     .kv-label {
       font-size: 11px;
-      color: var(--text-secondary);
+      color: var(--text-muted-aa);
       text-transform: uppercase;
       letter-spacing: 0.04em;
     }
@@ -706,7 +838,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       gap: 12px;
       flex-wrap: wrap;
       font-size: 11px;
-      color: var(--text-secondary);
+      color: var(--text-muted-aa);
     }
 
     .legend-swatch {
@@ -717,9 +849,37 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       margin-right: 4px;
       vertical-align: middle;
     }
+
+    footer.site-footer {
+      max-width: 1560px;
+      margin: 0 auto;
+      padding: 16px 24px 32px;
+      border-top: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+      font-size: 12px;
+      color: var(--text-muted-aa);
+    }
+
+    .footer-links {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .footer-links a {
+      color: var(--badge-teal-fg);
+      text-decoration: underline;
+    }
   </style>
 </head>
 <body>
+  <a class="skip-link" href="#main-workspace">Skip to main content</a>
+
   <header class="top-bar">
     <div class="brand-group">
       <h1>Clinical Trials Workbench</h1>
@@ -740,7 +900,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         <input type="checkbox" id="peer-coverage-toggle" checked />
         Include Peer Coverage
       </label>
-      <span id="telemetry-status-badge" class="badge badge-muted mono">Offline Snapshot</span>
+      <span id="telemetry-status-badge" class="badge badge-muted mono" role="status" aria-live="polite">[OFFLINE] Snapshot</span>
       <div class="theme-segmented" role="group" aria-label="Appearance Theme Selector">
         <button id="theme-btn-light" type="button" title="Light Theme" aria-label="Light Theme" data-theme-mode="light" aria-pressed="false">
           <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -771,21 +931,21 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
   </header>
 
-  <nav class="view-nav" aria-label="Workbench Views">
-    <button id="nav-tab-portfolio" class="view-tab active" data-view="portfolio" type="button">Level 1: Portfolio Workbench</button>
-    <button id="nav-tab-site" class="view-tab" data-view="site" type="button">Level 2: Single-Site View</button>
-    <button id="nav-tab-signal" class="view-tab" data-view="signal" type="button">Level 3: Signal Detail &amp; Evidence</button>
-    <button id="nav-tab-selection" class="view-tab" data-view="selection" type="button">Trial Selection Workbench</button>
-    <button id="nav-tab-analytics" class="view-tab" data-view="analytics" type="button">Conversational Analytics &amp; Provenance</button>
+  <nav class="view-nav" aria-label="Workbench Views" role="tablist">
+    <button id="nav-tab-portfolio" class="view-tab active" data-view="portfolio" type="button" role="tab" aria-selected="true" aria-controls="view-portfolio">Level 1: Portfolio Workbench</button>
+    <button id="nav-tab-site" class="view-tab" data-view="site" type="button" role="tab" aria-selected="false" aria-controls="view-site">Level 2: Single-Site View</button>
+    <button id="nav-tab-signal" class="view-tab" data-view="signal" type="button" role="tab" aria-selected="false" aria-controls="view-signal">Level 3: Signal Detail &amp; Evidence</button>
+    <button id="nav-tab-selection" class="view-tab" data-view="selection" type="button" role="tab" aria-selected="false" aria-controls="view-selection">Trial Selection Workbench</button>
+    <button id="nav-tab-analytics" class="view-tab" data-view="analytics" type="button" role="tab" aria-selected="false" aria-controls="view-analytics">Conversational Analytics &amp; Provenance</button>
   </nav>
 
-  <main class="workspace">
+  <main id="main-workspace" class="workspace" tabindex="-1">
     <!-- VIEW 1: LEVEL 1 PORTFOLIO WORKBENCH -->
-    <section id="view-portfolio" class="view-panel active" aria-labelledby="nav-tab-portfolio">
+    <section id="view-portfolio" class="view-panel active" role="tabpanel" aria-labelledby="nav-tab-portfolio">
       <div class="bento-grid">
         <div class="pane col-12">
           <div class="pane-header">
-            <span class="pane-title">Executive Briefing</span>
+            <h2 class="pane-title">Executive Briefing</h2>
             <span id="briefing-ref-date" class="pane-meta mono"></span>
           </div>
           <p id="executive-briefing-text"></p>
@@ -793,52 +953,52 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 
         <div class="pane col-3">
           <span class="pane-meta">Priority Action Sites</span>
-          <div id="kpi-priority-sites" class="kpi-value" style="color: var(--viz-rose);">0</div>
+          <div id="kpi-priority-sites" class="kpi-value" style="color: var(--kpi-rose);">0</div>
           <span id="kpi-tier-breakdown" class="kpi-sub mono"></span>
         </div>
         <div class="pane col-3">
           <span class="pane-meta">Active Risk Signals</span>
-          <div id="kpi-active-signals" class="kpi-value" style="color: var(--viz-amber);">0</div>
+          <div id="kpi-active-signals" class="kpi-value" style="color: var(--kpi-amber);">0</div>
           <span id="kpi-critical-signals" class="kpi-sub mono"></span>
         </div>
         <div class="pane col-3">
           <span class="pane-meta">Closed SAE Turnaround</span>
-          <div id="kpi-sae-days" class="kpi-value" style="color: var(--viz-teal);">0d</div>
+          <div id="kpi-sae-days" class="kpi-value" style="color: var(--kpi-teal);">0d</div>
           <span class="kpi-sub mono">Target: 7.0d | Legacy Baseline: 28.0d</span>
         </div>
         <div class="pane col-3">
           <span class="pane-meta">Trial-Eligible Candidates</span>
-          <div id="kpi-eligible-pool" class="kpi-value" style="color: var(--viz-emerald);">0</div>
+          <div id="kpi-eligible-pool" class="kpi-value" style="color: var(--kpi-emerald);">0</div>
           <span id="kpi-needs-labs-pool" class="kpi-sub mono"></span>
         </div>
 
         <div class="pane col-7">
           <div class="pane-header">
-            <span class="pane-title">Cross-Site Signal Concentration Heatmap</span>
+            <h2 class="pane-title">Cross-Site Signal Concentration Heatmap</h2>
             <div class="legend-inline">
-              <span><i class="legend-swatch" style="background:#0D9488"></i>Low</span>
-              <span><i class="legend-swatch" style="background:#4F46E5"></i>Elevated</span>
-              <span><i class="legend-swatch" style="background:#E11D48"></i>Critical</span>
+              <span><i class="legend-swatch" style="background:#0D9488" aria-hidden="true"></i>[LOW]</span>
+              <span><i class="legend-swatch" style="background:#4F46E5" aria-hidden="true"></i>[ELEVATED]</span>
+              <span><i class="legend-swatch" style="background:#E11D48" aria-hidden="true"></i>[CRITICAL]</span>
             </div>
           </div>
           <div class="canvas-stage" style="height:310px;">
-            <canvas id="canvas-heatmap"></canvas>
+            <canvas id="canvas-heatmap" role="img" aria-label="Cross-site signal concentration heatmap by clinical site and signal family"></canvas>
           </div>
         </div>
 
         <div class="pane col-5">
           <div class="pane-header">
-            <span class="pane-title">SAE Reporting Cycle Time vs 7-Day Target</span>
+            <h2 class="pane-title">SAE Reporting Cycle Time vs 7-Day Target</h2>
             <span class="pane-meta">Mean &amp; Max Days by Protocol</span>
           </div>
           <div class="canvas-stage" style="height:310px;">
-            <canvas id="canvas-sae-trend"></canvas>
+            <canvas id="canvas-sae-trend" role="img" aria-label="Serious Adverse Event mean and maximum reporting cycle time chart by study protocol"></canvas>
           </div>
         </div>
 
         <div class="pane col-12">
           <div class="pane-header">
-            <span class="pane-title">Portfolio Clinical Sites Grid</span>
+            <h2 class="pane-title">Portfolio Clinical Sites Grid</h2>
             <div class="filter-bar">
               <input id="portfolio-search" type="search" placeholder="Search site ID, name, country..." aria-label="Search clinical sites" />
               <select id="portfolio-study-filter" aria-label="Filter by study">
@@ -856,18 +1016,18 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
             <table id="portfolio-sites-table">
               <thead>
                 <tr>
-                  <th data-sort="site_id">Site ID</th>
-                  <th data-sort="site_name">Clinical Institution</th>
-                  <th data-sort="protocol_code">Protocol</th>
-                  <th data-sort="region">Region</th>
-                  <th data-sort="assigned_cra_id">CRA</th>
-                  <th data-sort="priority_tier">Priority Tier</th>
-                  <th class="num" data-sort="risk_score">Risk Score</th>
-                  <th class="num" data-sort="total_signals">Signals (Crit/Tot)</th>
-                  <th class="num" data-sort="enrolled_count">Enrolled</th>
-                  <th class="num" data-sort="local_eligible_candidates">Eligible Pool</th>
-                  <th>Last Monitored</th>
-                  <th>Drill-Down</th>
+                  <th scope="col" data-sort="site_id" tabindex="0" aria-sort="none">Site ID</th>
+                  <th scope="col" data-sort="site_name" tabindex="0" aria-sort="none">Clinical Institution</th>
+                  <th scope="col" data-sort="protocol_code" tabindex="0" aria-sort="none">Protocol</th>
+                  <th scope="col" data-sort="region" tabindex="0" aria-sort="none">Region</th>
+                  <th scope="col" data-sort="assigned_cra_id" tabindex="0" aria-sort="none">CRA</th>
+                  <th scope="col" data-sort="priority_tier" tabindex="0" aria-sort="none">Priority Tier</th>
+                  <th scope="col" class="num" data-sort="risk_score" tabindex="0" aria-sort="descending">Risk Score</th>
+                  <th scope="col" class="num" data-sort="total_signals" tabindex="0" aria-sort="none">Signals (Crit/Tot)</th>
+                  <th scope="col" class="num" data-sort="enrolled_count" tabindex="0" aria-sort="none">Enrolled</th>
+                  <th scope="col" class="num" data-sort="local_eligible_candidates" tabindex="0" aria-sort="none">Eligible Pool</th>
+                  <th scope="col">Last Monitored</th>
+                  <th scope="col">Drill-Down</th>
                 </tr>
               </thead>
               <tbody id="portfolio-sites-tbody"></tbody>
@@ -878,12 +1038,12 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     </section>
 
     <!-- VIEW 2: LEVEL 2 SINGLE-SITE VIEW -->
-    <section id="view-site" class="view-panel" aria-labelledby="nav-tab-site">
+    <section id="view-site" class="view-panel" role="tabpanel" aria-labelledby="nav-tab-site">
       <div class="bento-grid">
         <div class="pane col-12">
           <div class="pane-header">
             <div class="filter-bar">
-              <span class="pane-title">Single-Site Operational Workbench</span>
+              <h2 class="pane-title">Single-Site Operational Workbench</h2>
               <select id="site-view-selector" aria-label="Select Clinical Site"></select>
               <span id="site-tier-badge" class="badge"></span>
             </div>
@@ -897,19 +1057,19 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
 
         <div class="pane col-7">
-          <div class="subtab-bar" role="tablist">
-            <button class="subtab-btn active" data-site-subtab="signals" type="button">Signals</button>
-            <button class="subtab-btn" data-site-subtab="events" type="button">Safety &amp; EDC Events</button>
-            <button class="subtab-btn" data-site-subtab="issues" type="button">QMS Issues &amp; Training</button>
-            <button class="subtab-btn" data-site-subtab="pds" type="button">Protocol Deviations</button>
-            <button class="subtab-btn" data-site-subtab="candidates" type="button">Matched Candidates</button>
+          <div class="subtab-bar" role="tablist" aria-label="Single-Site Record Categories">
+            <button class="subtab-btn active" data-site-subtab="signals" type="button" role="tab" aria-selected="true">Signals</button>
+            <button class="subtab-btn" data-site-subtab="events" type="button" role="tab" aria-selected="false">Safety &amp; EDC Events</button>
+            <button class="subtab-btn" data-site-subtab="issues" type="button" role="tab" aria-selected="false">QMS Issues &amp; Training</button>
+            <button class="subtab-btn" data-site-subtab="pds" type="button" role="tab" aria-selected="false">Protocol Deviations</button>
+            <button class="subtab-btn" data-site-subtab="candidates" type="button" role="tab" aria-selected="false">Matched Candidates</button>
           </div>
-          <div id="site-subtab-container" class="table-wrap"></div>
+          <div id="site-subtab-container" class="table-wrap" role="tabpanel"></div>
         </div>
 
         <div class="pane col-5">
           <div class="pane-header">
-            <span id="site-draft-title" class="pane-title">Drafted Monitoring Visit Agenda</span>
+            <h2 id="site-draft-title" class="pane-title">Drafted Monitoring Visit Agenda</h2>
             <button id="btn-copy-site-draft" type="button">Copy Draft Text</button>
           </div>
           <pre id="site-draft-output" class="code-output"></pre>
@@ -918,12 +1078,12 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     </section>
 
     <!-- VIEW 3: LEVEL 3 SIGNAL DETAIL & EVIDENCE -->
-    <section id="view-signal" class="view-panel" aria-labelledby="nav-tab-signal">
+    <section id="view-signal" class="view-panel" role="tabpanel" aria-labelledby="nav-tab-signal">
       <div class="bento-grid">
         <div class="pane col-12">
           <div class="pane-header">
             <div class="filter-bar">
-              <span class="pane-title">Signal Auditability &amp; Source Evidence</span>
+              <h2 class="pane-title">Signal Auditability &amp; Source Evidence</h2>
               <select id="signal-view-selector" aria-label="Select Risk Signal"></select>
               <span id="signal-severity-badge" class="badge"></span>
               <span id="signal-disposition-badge" class="badge badge-muted"></span>
@@ -937,7 +1097,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 
         <div class="pane col-6">
           <div class="pane-header">
-            <span class="pane-title">Source-System Evidence Provenance</span>
+            <h2 class="pane-title">Source-System Evidence Provenance</h2>
             <span class="pane-meta">Immutable Audit Citation</span>
           </div>
           <div class="table-wrap">
@@ -946,11 +1106,11 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
             </table>
           </div>
           <div class="pane-header" style="margin-top:8px;">
-            <span class="pane-title">Human-in-the-Loop Disposition</span>
+            <h2 class="pane-title">Human-in-the-Loop Disposition</h2>
             <span class="pane-meta">Captured in Feedback Store</span>
           </div>
           <div class="filter-bar">
-            <input id="signal-feedback-note" type="text" placeholder="Optional reviewer rationale or modification..." style="flex:1; min-width:200px;" />
+            <input id="signal-feedback-note" type="text" placeholder="Optional reviewer rationale or modification..." aria-label="Optional reviewer rationale or modification" style="flex:1; min-width:200px;" />
             <button id="btn-feedback-accept" class="btn-primary" type="button">Accept</button>
             <button id="btn-feedback-modify" type="button">Modify</button>
             <button id="btn-feedback-dismiss" type="button">Dismiss</button>
@@ -959,23 +1119,23 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 
         <div class="pane col-6">
           <div class="pane-header">
-            <span class="pane-title">Historical 8-Week Site Signal Trend</span>
+            <h2 class="pane-title">Historical 8-Week Site Signal Trend</h2>
             <span id="signal-trend-subtitle" class="pane-meta mono"></span>
           </div>
           <div class="viz-toolbar">
             <div class="legend-inline">
-              <span><i class="legend-swatch" style="background:#E11D48"></i>Site Trajectory</span>
-              <span><i class="legend-swatch" style="background:#4F46E5"></i>Peer Cohort Avg</span>
-              <span><i class="legend-swatch" style="background:#0D9488"></i>Weekly Load</span>
-              <span><i class="legend-swatch" style="background:#D97706"></i>Watch Band</span>
+              <span><i class="legend-swatch" style="background:#E11D48" aria-hidden="true"></i>Site Trajectory</span>
+              <span><i class="legend-swatch" style="background:#4F46E5" aria-hidden="true"></i>Peer Cohort Avg</span>
+              <span><i class="legend-swatch" style="background:#0D9488" aria-hidden="true"></i>Weekly Load</span>
+              <span><i class="legend-swatch" style="background:#D97706" aria-hidden="true"></i>Watch Band</span>
             </div>
             <span class="pane-meta mono">Hover Week to Scrub</span>
           </div>
           <div class="canvas-stage" style="height:260px;">
-            <canvas id="canvas-site-trend"></canvas>
+            <canvas id="canvas-site-trend" role="img" aria-label="Historical 8-week site risk signal trend compared with peer cohort average"></canvas>
           </div>
           <div class="pane-header">
-            <span class="pane-title">Exportable Source-System Issue / CAPA Payload</span>
+            <h2 class="pane-title">Exportable Source-System Issue / CAPA Payload</h2>
             <button id="btn-copy-issue-json" type="button">Copy JSON</button>
           </div>
           <pre id="signal-issue-json" class="code-output" style="max-height:150px;"></pre>
@@ -984,15 +1144,15 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     </section>
 
     <!-- VIEW 4: CLINICAL TRIAL SELECTION WORKBENCH -->
-    <section id="view-selection" class="view-panel" aria-labelledby="nav-tab-selection">
+    <section id="view-selection" class="view-panel" role="tabpanel" aria-labelledby="nav-tab-selection">
       <div class="bento-grid">
         <div class="pane col-6">
           <div class="pane-header">
-            <span class="pane-title">3D Biomarker &amp; Organ-Function Projection</span>
+            <h2 class="pane-title">3D Biomarker &amp; Organ-Function Projection</h2>
             <div class="legend-inline">
-              <span><i class="legend-swatch" style="background:#059669"></i>Eligible</span>
-              <span><i class="legend-swatch" style="background:#D97706"></i>Needs Labs</span>
-              <span><i class="legend-swatch" style="background:#E11D48"></i>Ineligible</span>
+              <span><i class="legend-swatch" style="background:#059669" aria-hidden="true"></i>[ELIGIBLE]</span>
+              <span><i class="legend-swatch" style="background:#D97706" aria-hidden="true"></i>[NEEDS LABS]</span>
+              <span><i class="legend-swatch" style="background:#E11D48" aria-hidden="true"></i>[INELIGIBLE]</span>
             </div>
           </div>
           <div class="viz-toolbar">
@@ -1000,47 +1160,47 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
               <button type="button" class="viz-chip active" data-cam3d="iso">Isometric</button>
               <button type="button" class="viz-chip" data-cam3d="xy">Biomarker / eGFR</button>
               <button type="button" class="viz-chip" data-cam3d="top">Top Cohort</button>
-              <button type="button" id="btn-3d-orbit" class="viz-chip">Auto-Orbit</button>
+              <button type="button" id="btn-3d-orbit" class="viz-chip" aria-pressed="false">Auto-Orbit</button>
             </div>
             <div class="viz-btn-group">
-              <button type="button" id="btn-3d-envelope" class="viz-chip active">Protocol Envelope</button>
+              <button type="button" id="btn-3d-envelope" class="viz-chip active" aria-pressed="true">Protocol Envelope</button>
               <button type="button" id="btn-3d-reset" class="viz-chip">Reset</button>
             </div>
           </div>
           <div class="canvas-stage tall" style="height:395px;">
-            <canvas id="canvas-3d-biomarker"></canvas>
+            <canvas id="canvas-3d-biomarker" role="img" aria-label="Interactive 3D biomarker, renal eGFR, and severity projection of synthetic trial candidates"></canvas>
           </div>
         </div>
 
         <div class="pane col-6">
           <div class="pane-header">
-            <span class="pane-title">Interactive Relationship Node Map</span>
+            <h2 class="pane-title">Interactive Relationship Node Map</h2>
             <div class="legend-inline">
-              <span><i class="legend-swatch" style="background:#4F46E5"></i>Protocol</span>
-              <span><i class="legend-swatch" style="background:#E11D48"></i>Priority Site/Signal</span>
-              <span><i class="legend-swatch" style="background:#0D9488"></i>Referral</span>
+              <span><i class="legend-swatch" style="background:#4F46E5" aria-hidden="true"></i>Protocol</span>
+              <span><i class="legend-swatch" style="background:#E11D48" aria-hidden="true"></i>Priority Site/Signal</span>
+              <span><i class="legend-swatch" style="background:#0D9488" aria-hidden="true"></i>Referral</span>
             </div>
           </div>
           <div class="viz-toolbar">
             <div class="viz-btn-group" role="group" aria-label="Topology Layer Mode">
-              <button type="button" class="viz-chip active" data-nodelayer="all">Full Topology</button>
-              <button type="button" class="viz-chip" data-nodelayer="signals">Risk Signals</button>
-              <button type="button" class="viz-chip" data-nodelayer="referrals">Candidate Flow</button>
+              <button type="button" class="viz-chip active" data-nodelayer="all" aria-pressed="true">Full Topology</button>
+              <button type="button" class="viz-chip" data-nodelayer="signals" aria-pressed="false">Risk Signals</button>
+              <button type="button" class="viz-chip" data-nodelayer="referrals" aria-pressed="false">Candidate Flow</button>
             </div>
             <div class="viz-btn-group">
-              <button id="btn-nodemap-zout" class="viz-chip" type="button" title="Zoom Out">-</button>
-              <button id="btn-nodemap-zin" class="viz-chip" type="button" title="Zoom In">+</button>
+              <button id="btn-nodemap-zout" class="viz-chip" type="button" title="Zoom Out" aria-label="Zoom out node map">-</button>
+              <button id="btn-nodemap-zin" class="viz-chip" type="button" title="Zoom In" aria-label="Zoom in node map">+</button>
               <button id="btn-reset-nodemap" class="viz-chip" type="button">Reset Camera</button>
             </div>
           </div>
           <div class="canvas-stage tall" style="height:395px;">
-            <canvas id="canvas-nodemap"></canvas>
+            <canvas id="canvas-nodemap" role="img" aria-label="Interactive relationship network graph connecting study protocols, clinical sites, risk signals, and patient referrals"></canvas>
           </div>
         </div>
 
         <div class="pane col-7">
           <div class="pane-header">
-            <span class="pane-title">Synthetic Candidate Patient Pool</span>
+            <h2 class="pane-title">Synthetic Candidate Patient Pool</h2>
             <div class="filter-bar">
               <input id="patient-search-input" type="search" placeholder="Search PAT ID, ICD-10, stage..." aria-label="Search synthetic patients" />
               <select id="patient-study-filter" aria-label="Filter candidates by study">
@@ -1058,15 +1218,15 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
             <table>
               <thead>
                 <tr>
-                  <th>Patient ID</th>
-                  <th>Age/Sex</th>
-                  <th>Region</th>
-                  <th>ICD-10</th>
-                  <th class="num">ECOG</th>
-                  <th>Matched Protocol</th>
-                  <th>Classification</th>
-                  <th class="num">Score</th>
-                  <th>Recommended Site</th>
+                  <th scope="col">Patient ID</th>
+                  <th scope="col">Age/Sex</th>
+                  <th scope="col">Region</th>
+                  <th scope="col">ICD-10</th>
+                  <th scope="col" class="num">ECOG</th>
+                  <th scope="col">Matched Protocol</th>
+                  <th scope="col">Classification</th>
+                  <th scope="col" class="num">Score</th>
+                  <th scope="col">Recommended Site</th>
                 </tr>
               </thead>
               <tbody id="patient-selection-tbody"></tbody>
@@ -1076,7 +1236,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 
         <div class="pane col-5">
           <div class="pane-header">
-            <span class="pane-title">Inclusion &amp; Exclusion Audit Matrix</span>
+            <h2 class="pane-title">Inclusion &amp; Exclusion Audit Matrix</h2>
             <span id="selected-patient-label" class="pane-meta mono"></span>
           </div>
           <div id="selected-patient-labs" class="kv-list"></div>
@@ -1084,10 +1244,10 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
             <table>
               <thead>
                 <tr>
-                  <th>Criterion</th>
-                  <th>Status</th>
-                  <th>Observed</th>
-                  <th>Protocol Rule</th>
+                  <th scope="col">Criterion</th>
+                  <th scope="col">Status</th>
+                  <th scope="col">Observed</th>
+                  <th scope="col">Protocol Rule</th>
                 </tr>
               </thead>
               <tbody id="patient-criteria-tbody"></tbody>
@@ -1098,34 +1258,34 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     </section>
 
     <!-- VIEW 5: CONVERSATIONAL ANALYTICS & PROVENANCE -->
-    <section id="view-analytics" class="view-panel" aria-labelledby="nav-tab-analytics">
+    <section id="view-analytics" class="view-panel" role="tabpanel" aria-labelledby="nav-tab-analytics">
       <div class="bento-grid">
         <div class="pane col-12">
           <div class="pane-header">
-            <span class="pane-title">Conversational Clinical &amp; Operational Analytics</span>
+            <h2 class="pane-title">Conversational Clinical &amp; Operational Analytics</h2>
             <span class="pane-meta">Full Transparency: Narrative + Chart + SQL + Underlying Rows</span>
           </div>
           <div class="filter-bar">
             <select id="analytics-preset-select" aria-label="Curated analytical questions" style="max-width:440px;"></select>
-            <input id="analytics-question-input" type="text" placeholder="Ask a clinical operations question or enter a read-only SELECT query..." style="flex:1; min-width:260px;" />
+            <input id="analytics-question-input" type="text" placeholder="Ask a clinical operations question or enter a read-only SELECT query..." aria-label="Analytical question or read-only SQL query" style="flex:1; min-width:260px;" />
             <button id="btn-run-analytics" class="btn-primary" type="button">Run Analysis</button>
           </div>
-          <p id="analytics-narrative-output"></p>
+          <p id="analytics-narrative-output" role="status" aria-live="polite"></p>
         </div>
 
         <div class="pane col-6">
           <div class="pane-header">
-            <span id="analytics-chart-title" class="pane-title">Analytical Series Plot</span>
+            <h2 id="analytics-chart-title" class="pane-title">Analytical Series Plot</h2>
             <span id="analytics-provenance-pills" class="pane-meta mono"></span>
           </div>
           <div class="canvas-stage" style="height:260px;">
-            <canvas id="canvas-analytics-chart"></canvas>
+            <canvas id="canvas-analytics-chart" role="img" aria-label="Analytical query result bar chart"></canvas>
           </div>
         </div>
 
         <div class="pane col-6">
           <div class="pane-header">
-            <span class="pane-title">Generated Read-Only SQL Query</span>
+            <h2 class="pane-title">Generated Read-Only SQL Query</h2>
             <button id="btn-copy-sql" type="button">Copy SQL</button>
           </div>
           <pre id="analytics-sql-output" class="code-output" style="max-height:260px;"></pre>
@@ -1133,7 +1293,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 
         <div class="pane col-7">
           <div class="pane-header">
-            <span class="pane-title">Underlying Tabular Result Set</span>
+            <h2 class="pane-title">Underlying Tabular Result Set</h2>
             <span id="analytics-row-count" class="pane-meta mono"></span>
           </div>
           <div class="table-wrap" style="max-height:290px;">
@@ -1146,17 +1306,17 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 
         <div class="pane col-5">
           <div class="pane-header">
-            <span class="pane-title">Cross-System Data Provenance &amp; Validation</span>
+            <h2 class="pane-title">Cross-System Data Provenance &amp; Validation</h2>
             <span id="provenance-totals-meta" class="pane-meta mono"></span>
           </div>
           <div class="table-wrap" style="max-height:290px;">
             <table>
               <thead>
                 <tr>
-                  <th>Source Feed</th>
-                  <th>Format</th>
-                  <th class="num">Records</th>
-                  <th>SHA-256 Prefix</th>
+                  <th scope="col">Source Feed</th>
+                  <th scope="col">Format</th>
+                  <th scope="col" class="num">Records</th>
+                  <th scope="col">SHA-256 Prefix</th>
                 </tr>
               </thead>
               <tbody id="provenance-sources-tbody"></tbody>
@@ -1166,6 +1326,20 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
     </section>
   </main>
+
+  <footer class="site-footer">
+    <div>
+      <span>Synthetic De-Identified Reference Workbench (Non-GxP) | Zero External Tracking</span>
+    </div>
+    <div class="footer-links">
+      <a href="/privacy">Privacy</a>
+      <a href="/terms">Terms</a>
+      <a href="/refunds">Refunds</a>
+      <a href="/cookies">Cookies &amp; Storage</a>
+      <button id="btn-export-local-data" type="button">Export Local Data</button>
+      <button id="btn-clear-local-data" type="button">Clear Local Data</button>
+    </div>
+  </footer>
 
   <div id="canvas-tooltip" class="canvas-tooltip" role="status" aria-live="polite"></div>
 
@@ -1182,11 +1356,43 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       rose: "#E11D48"
     };
 
+    function readStorage(key, fallback) {
+      try {
+        const val = window.localStorage.getItem(key);
+        return val === null ? fallback : val;
+      } catch (e) {
+        return fallback;
+      }
+    }
+
+    function writeStorage(key, val) {
+      try {
+        window.localStorage.setItem(key, val);
+      } catch (e) {}
+    }
+
+    function removeStorage(key) {
+      try {
+        window.localStorage.removeItem(key);
+      } catch (e) {}
+    }
+
+    function readJsonStorage(key, fallback) {
+      try {
+        const raw = readStorage(key, null);
+        if (!raw) return fallback;
+        const parsed = JSON.parse(raw);
+        return (parsed && typeof parsed === "object" && !Array.isArray(parsed)) ? parsed : fallback;
+      } catch (e) {
+        return fallback;
+      }
+    }
+
     const rawBundle = document.getElementById("workspace-data-bundle").textContent;
     let WORKSPACE = JSON.parse(rawBundle);
 
     const STATE = {
-      themeMode: localStorage.getItem("ctw_theme_mode") || "system",
+      themeMode: readStorage("ctw_theme_mode", "system") || "system",
       activeTheme: "light",
       activeView: "portfolio",
       craScope: "ALL",
@@ -1203,7 +1409,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       siteDraftMode: "agenda",
 
       selectedSignalId: WORKSPACE.signals[0] ? WORKSPACE.signals[0].signal_id : "SIG-1001",
-      localFeedback: JSON.parse(localStorage.getItem("ctw_hitl_feedback") || "{}"),
+      localFeedback: readJsonStorage("ctw_hitl_feedback", {}),
 
       patientSearch: "",
       patientStudy: "ALL",
@@ -1257,7 +1463,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 
     function applyThemeMode(mode) {
       STATE.themeMode = mode;
-      localStorage.setItem("ctw_theme_mode", mode);
+      writeStorage("ctw_theme_mode", mode);
       STATE.activeTheme = resolveActiveTheme(mode);
       document.documentElement.setAttribute("data-theme", STATE.activeTheme);
 
@@ -1268,7 +1474,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         btn.classList.toggle("active", isActive);
         btn.setAttribute("aria-pressed", isActive ? "true" : "false");
       });
-      redrawAllCanvases();
+      redrawAllPlots();
     }
 
     if (mediaDark) {
@@ -1293,7 +1499,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         page: dark ? "#0D0E11" : "#FAFAF9",
         border: dark ? "#292A30" : "#E7E5E4",
         text: dark ? "#ECE8E2" : "#1C1917",
-        muted: dark ? "#9A9895" : "#787774"
+        muted: dark ? "#9A9895" : "#57534E"
       };
     }
 
@@ -1302,13 +1508,20 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;");
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
     }
 
     function tierBadgeClass(tier) {
       if (tier === "Priority Action Required") return "badge-priority";
       if (tier === "Important Signals Next") return "badge-important";
       return "badge-monitor";
+    }
+
+    function tierBadgeLabel(tier) {
+      if (tier === "Priority Action Required") return "[PRIORITY] " + tier;
+      if (tier === "Important Signals Next") return "[IMPORTANT] " + tier;
+      return "[MONITOR] " + tier;
     }
 
     function sevBadgeClass(sev) {
@@ -1391,7 +1604,9 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     function switchView(viewName) {
       STATE.activeView = viewName;
       document.querySelectorAll(".view-tab").forEach(function (btn) {
-        btn.classList.toggle("active", btn.getAttribute("data-view") === viewName);
+        const isActive = btn.getAttribute("data-view") === viewName;
+        btn.classList.toggle("active", isActive);
+        btn.setAttribute("aria-selected", isActive ? "true" : "false");
       });
       document.querySelectorAll(".view-panel").forEach(function (panel) {
         panel.classList.toggle("active", panel.id === "view-" + viewName);
@@ -1399,14 +1614,39 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       renderActiveView();
     }
 
-    document.querySelectorAll(".view-tab").forEach(function (btn) {
+    const viewTabs = Array.prototype.slice.call(document.querySelectorAll(".view-tab"));
+    viewTabs.forEach(function (btn, idx) {
       btn.addEventListener("click", function () {
         switchView(btn.getAttribute("data-view"));
+      });
+      btn.addEventListener("keydown", function (ev) {
+        let nextIdx = null;
+        if (ev.key === "ArrowRight") nextIdx = (idx + 1) % viewTabs.length;
+        else if (ev.key === "ArrowLeft") nextIdx = (idx - 1 + viewTabs.length) % viewTabs.length;
+        else if (ev.key === "Home") nextIdx = 0;
+        else if (ev.key === "End") nextIdx = viewTabs.length - 1;
+        if (nextIdx !== null) {
+          ev.preventDefault();
+          viewTabs[nextIdx].focus();
+          switchView(viewTabs[nextIdx].getAttribute("data-view"));
+        }
       });
     });
 
     /* --- LEVEL 1 RENDERER --- */
+    function syncSortHeaderAria() {
+      document.querySelectorAll("#portfolio-sites-table th[data-sort]").forEach(function (th) {
+        const col = th.getAttribute("data-sort");
+        if (col === STATE.sortCol) {
+          th.setAttribute("aria-sort", STATE.sortDesc ? "descending" : "ascending");
+        } else {
+          th.setAttribute("aria-sort", "none");
+        }
+      });
+    }
+
     function renderPortfolio() {
+      syncSortHeaderAria();
       const scopedSites = getScopedSites();
       const scopedIds = new Set(scopedSites.map(function (s) { return s.site_id; }));
       const activeSignals = WORKSPACE.signals.filter(function (sig) {
@@ -1439,7 +1679,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
           '<td class="mono">' + escHtml(s.protocol_code) + '</td>' +
           '<td class="mono">' + escHtml(s.region) + '</td>' +
           '<td class="mono">' + escHtml(s.assigned_cra_id) + '</td>' +
-          '<td><span class="badge ' + tierBadgeClass(s.priority_tier) + '">' + escHtml(s.priority_tier) + '</span></td>' +
+          '<td><span class="badge ' + tierBadgeClass(s.priority_tier) + '">' + escHtml(tierBadgeLabel(s.priority_tier)) + '</span></td>' +
           '<td class="num">' + s.risk_score + '</td>' +
           '<td class="num">' + s.signal_counts.CRITICAL + ' / ' + s.signal_counts.TOTAL + '</td>' +
           '<td class="num">' + s.enrolled_count + ' / ' + s.target_enrollment + '</td>' +
@@ -1459,8 +1699,8 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         });
       });
 
-      drawHeatmapCanvas();
-      drawSaeTrendCanvas();
+      drawHeatmapPlot();
+      drawSaeTrendPlot();
     }
 
     /* --- LEVEL 2 SINGLE-SITE RENDERER --- */
@@ -1534,15 +1774,15 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       document.getElementById("site-view-selector").value = site.site_id;
       const badge = document.getElementById("site-tier-badge");
       badge.className = "badge " + tierBadgeClass(site.priority_tier);
-      badge.textContent = site.priority_tier;
+      badge.textContent = tierBadgeLabel(site.priority_tier);
 
       document.getElementById("site-metadata-strip").innerHTML = [
         ["Study Protocol", site.protocol_code + " (" + site.study_id + ")"],
-        ["Site Status", site.site_status],
+        ["Site Status", "[" + site.site_status + "]"],
         ["Assigned / Peer CRA", site.assigned_cra_id + " / " + site.peer_cra_id],
         ["Last Monitoring", site.last_monitoring_date + " (" + site.days_since_monitoring + "d ago)"],
         ["Enrollment", site.enrolled_count + " / " + site.target_enrollment + " subjects"],
-        ["IRT Kits / Excursion", site.available_kits + " kits / " + (site.unresolved_excursion ? "EXCURSION" : "Clear")]
+        ["IRT Kits / Excursion", site.available_kits + " kits / " + (site.unresolved_excursion ? "[EXCURSION]" : "[CLEAR]")]
       ].map(function (pair) {
         return '<div><div class="kv-label">' + escHtml(pair[0]) + '</div><div class="kv-val mono">' + escHtml(pair[1]) + "</div></div>";
       }).join("");
@@ -1555,15 +1795,15 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       if (sub === "signals") {
         const sigs = WORKSPACE.signals.filter(function (s) { return s.site_id === site.site_id; });
         container.innerHTML =
-          '<table><thead><tr><th>Include</th><th>Signal</th><th>Family</th><th>Severity</th><th>Title</th><th>Disposition</th><th>Evidence</th></tr></thead><tbody>' +
+          '<table><thead><tr><th scope="col">Include</th><th scope="col">Signal</th><th scope="col">Family</th><th scope="col">Severity</th><th scope="col">Title</th><th scope="col">Disposition</th><th scope="col">Evidence</th></tr></thead><tbody>' +
           (sigs.length ? sigs.map(function (sig) {
             const checked = STATE.checkedSignalIds.size === 0 || STATE.checkedSignalIds.has(sig.signal_id);
             return (
               "<tr>" +
-              '<td><input type="checkbox" data-sig-check="' + escHtml(sig.signal_id) + '" ' + (checked ? "checked" : "") + " /></td>" +
+              '<td><input type="checkbox" aria-label="Include signal ' + escHtml(sig.signal_id) + ' in draft" data-sig-check="' + escHtml(sig.signal_id) + '" ' + (checked ? "checked" : "") + " /></td>" +
               '<td class="mono">' + escHtml(sig.signal_id) + "</td>" +
               '<td class="mono">' + escHtml(sig.family) + "</td>" +
-              '<td><span class="badge ' + sevBadgeClass(sig.severity) + '">' + escHtml(sig.severity) + "</span></td>" +
+              '<td><span class="badge ' + sevBadgeClass(sig.severity) + '">[' + escHtml(sig.severity) + "]</span></td>" +
               "<td>" + escHtml(sig.title) + "</td>" +
               '<td class="mono">' + escHtml(sig.disposition) + "</td>" +
               '<td><button type="button" data-open-signal="' + escHtml(sig.signal_id) + '">Audit Evidence</button></td>' +
@@ -1595,40 +1835,40 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         const saes = site.safety_events || [];
         const visits = site.edc_visits || [];
         container.innerHTML =
-          '<table><thead><tr><th>Source</th><th>Record ID</th><th>Subject</th><th>Detail</th><th class="num">Metric</th><th>Status</th></tr></thead><tbody>' +
+          '<table><thead><tr><th scope="col">Source</th><th scope="col">Record ID</th><th scope="col">Subject</th><th scope="col">Detail</th><th scope="col" class="num">Metric</th><th scope="col">Status</th></tr></thead><tbody>' +
           saes.map(function (e) {
             return '<tr><td class="mono">Safety/PV</td><td class="mono">' + escHtml(e.sae_id) + '</td><td class="mono">' + escHtml(e.subject_id) +
               "</td><td>" + escHtml(e.event_term) + " (Grade " + e.ctcae_grade + ')</td><td class="num">' + e.followup_cycle_days +
-              'd cycle</td><td class="mono">' + escHtml(e.report_status) + "</td></tr>";
+              'd cycle</td><td class="mono">[' + escHtml(e.report_status) + "]</td></tr>";
           }).join("") +
           visits.map(function (v) {
             return '<tr><td class="mono">EDC Visit</td><td class="mono">' + escHtml(v.visit_record_id) + '</td><td class="mono">' + escHtml(v.subject_id) +
               "</td><td>" + escHtml(v.visit_name) + " (ICF " + escHtml(v.signed_icf_version) + ')</td><td class="num">' + v.open_queries +
-              " queries (" + v.max_query_age_days + 'd)</td><td class="mono">' + escHtml(v.visit_status) + "</td></tr>";
+              " queries (" + v.max_query_age_days + 'd)</td><td class="mono">[' + escHtml(v.visit_status) + "]</td></tr>";
           }).join("") +
           "</tbody></table>";
       } else if (sub === "issues") {
         const issues = site.quality_issues || [];
         const trn = site.training_records || [];
         container.innerHTML =
-          '<table><thead><tr><th>Type</th><th>ID</th><th>Category / Role</th><th class="num">Days / Expiry</th><th>Status</th><th>Summary</th></tr></thead><tbody>' +
+          '<table><thead><tr><th scope="col">Type</th><th scope="col">ID</th><th scope="col">Category / Role</th><th scope="col" class="num">Days / Expiry</th><th scope="col">Status</th><th scope="col">Summary</th></tr></thead><tbody>' +
           issues.map(function (i) {
             return '<tr><td class="mono">QMS Issue</td><td class="mono">' + escHtml(i.issue_id) + "</td><td>" + escHtml(i.category) +
-              '</td><td class="num">' + i.days_open + 'd open</td><td class="mono">' + escHtml(i.status) + "</td><td>" + escHtml(i.summary) + "</td></tr>";
+              '</td><td class="num">' + i.days_open + 'd open</td><td class="mono">[' + escHtml(i.status) + "]</td><td>" + escHtml(i.summary) + "</td></tr>";
           }).join("") +
           trn.map(function (t) {
             return '<tr><td class="mono">LMS Cert</td><td class="mono">' + escHtml(t.training_id) + "</td><td>" + escHtml(t.staff_role_id + " / " + t.cert_type) +
-              '</td><td class="num">' + t.days_until_expiry + 'd</td><td class="mono">' + escHtml(t.status) + "</td><td>Staff certification record</td></tr>";
+              '</td><td class="num">' + t.days_until_expiry + 'd</td><td class="mono">[' + escHtml(t.status) + "]</td><td>Staff certification record</td></tr>";
           }).join("") +
           "</tbody></table>";
       } else if (sub === "pds") {
         const pds = site.protocol_deviations || [];
         container.innerHTML =
-          '<table><thead><tr><th>PD ID</th><th>Subject</th><th>Category</th><th>Severity</th><th class="num">Days Open</th><th>CAPA</th><th>Description</th></tr></thead><tbody>' +
+          '<table><thead><tr><th scope="col">PD ID</th><th scope="col">Subject</th><th scope="col">Category</th><th scope="col">Severity</th><th scope="col" class="num">Days Open</th><th scope="col">CAPA</th><th scope="col">Description</th></tr></thead><tbody>' +
           (pds.length ? pds.map(function (p) {
             return '<tr><td class="mono">' + escHtml(p.pd_id) + '</td><td class="mono">' + escHtml(p.subject_id) + "</td><td>" + escHtml(p.category) +
-              '</td><td><span class="badge ' + (p.severity === "MAJOR" ? "badge-critical" : "badge-muted") + '">' + escHtml(p.severity) +
-              '</span></td><td class="num">' + p.days_open + '</td><td class="mono">' + (p.capa_required ? "Required" : "No") +
+              '</td><td><span class="badge ' + (p.severity === "MAJOR" ? "badge-critical" : "badge-muted") + '">[' + escHtml(p.severity) +
+              ']</span></td><td class="num">' + p.days_open + '</td><td class="mono">' + (p.capa_required ? "Required" : "No") +
               "</td><td>" + escHtml(p.description) + "</td></tr>";
           }).join("") : '<tr><td colspan="7">Zero protocol deviations logged at this site.</td></tr>') +
           "</tbody></table>";
@@ -1637,11 +1877,11 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
           return p.recommended_site_id === site.site_id;
         });
         container.innerHTML =
-          '<table><thead><tr><th>Patient ID</th><th>Age/Sex</th><th>ICD-10</th><th>Classification</th><th class="num">Match Score</th><th>Action</th></tr></thead><tbody>' +
+          '<table><thead><tr><th scope="col">Patient ID</th><th scope="col">Age/Sex</th><th scope="col">ICD-10</th><th scope="col">Classification</th><th scope="col" class="num">Match Score</th><th scope="col">Action</th></tr></thead><tbody>' +
           (cands.length ? cands.map(function (p) {
             return '<tr><td class="mono">' + escHtml(p.patient_id) + '</td><td class="mono">' + p.age_years + "/" + escHtml(p.sex) +
-              '</td><td class="mono">' + escHtml(p.primary_icd10) + '</td><td><span class="badge ' + classifBadgeClass(p.primary_classification) + '">' +
-              escHtml(p.primary_classification) + '</span></td><td class="num">' + p.primary_match_score +
+              '</td><td class="mono">' + escHtml(p.primary_icd10) + '</td><td><span class="badge ' + classifBadgeClass(p.primary_classification) + '">[' +
+              escHtml(p.primary_classification) + ']</span></td><td class="num">' + p.primary_match_score +
               '</td><td><button type="button" data-inspect-pat="' + escHtml(p.patient_id) + '">Open in Trial Selector</button></td></tr>';
           }).join("") : '<tr><td colspan="6">No candidates currently routed to this site.</td></tr>') +
           "</tbody></table>";
@@ -1664,10 +1904,10 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       document.getElementById("signal-view-selector").value = sig.signal_id;
       const sevBadge = document.getElementById("signal-severity-badge");
       sevBadge.className = "badge " + sevBadgeClass(sig.severity);
-      sevBadge.textContent = sig.severity + " (Weight " + sig.weight + ")";
+      sevBadge.textContent = "[" + sig.severity + "] Weight " + sig.weight;
 
       const dispBadge = document.getElementById("signal-disposition-badge");
-      dispBadge.textContent = "Disposition: " + sig.disposition;
+      dispBadge.textContent = "[DISPOSITION: " + sig.disposition + "]";
 
       document.getElementById("signal-kv-strip").innerHTML = [
         ["Signal / Rule ID", sig.signal_id + " / " + sig.rule_id],
@@ -1692,7 +1932,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         ["Protocol / SLA Threshold", String(ev.threshold_value)],
         ["Reviewer Note", sig.reviewer_note || "None recorded"]
       ].map(function (r) {
-        return "<tr><th>" + escHtml(r[0]) + '</th><td class="mono">' + escHtml(r[1]) + "</td></tr>";
+        return '<tr><th scope="row">' + escHtml(r[0]) + '</th><td class="mono">' + escHtml(r[1]) + "</td></tr>";
       }).join("");
 
       const issuePayload = {
@@ -1712,7 +1952,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       };
       document.getElementById("signal-issue-json").textContent = JSON.stringify(issuePayload, null, 2);
       document.getElementById("signal-trend-subtitle").textContent = sig.site_id + " (W-7 to Current)";
-      drawSiteTrendCanvas(sig);
+      drawSiteTrendPlot(sig);
     }
 
     function submitFeedback(disposition) {
@@ -1727,7 +1967,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         note: note,
         updated_at: new Date().toISOString()
       };
-      localStorage.setItem("ctw_hitl_feedback", JSON.stringify(STATE.localFeedback));
+      writeStorage("ctw_hitl_feedback", JSON.stringify(STATE.localFeedback));
 
       /* Also notify backend if running via HTTP/SSE server */
       if (window.location.protocol.startsWith("http")) {
@@ -1760,14 +2000,14 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       tbody.innerHTML = filtered.map(function (p) {
         const isSel = p.patient_id === STATE.selectedPatientId;
         return (
-          '<tr data-pat-row="' + escHtml(p.patient_id) + '" class="' + (isSel ? "selected-row" : "") + '">' +
+          '<tr data-pat-row="' + escHtml(p.patient_id) + '" tabindex="0" aria-selected="' + (isSel ? "true" : "false") + '" class="' + (isSel ? "selected-row" : "") + '">' +
           '<td class="mono"><strong>' + escHtml(p.patient_id) + "</strong></td>" +
           '<td class="mono">' + p.age_years + " / " + escHtml(p.sex) + "</td>" +
           '<td class="mono">' + escHtml(p.region) + "</td>" +
           '<td class="mono">' + escHtml(p.primary_icd10) + "</td>" +
           '<td class="num">' + p.ecog_status + "</td>" +
           '<td class="mono">' + escHtml(p.primary_match_protocol) + "</td>" +
-          '<td><span class="badge ' + classifBadgeClass(p.primary_classification) + '">' + escHtml(p.primary_classification) + "</span></td>" +
+          '<td><span class="badge ' + classifBadgeClass(p.primary_classification) + '">[' + escHtml(p.primary_classification) + "]</span></td>" +
           '<td class="num">' + p.primary_match_score + "</td>" +
           '<td class="mono">' + escHtml(p.recommended_site_id || "Disqualified") + "</td>" +
           "</tr>"
@@ -1775,9 +2015,16 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       }).join("");
 
       tbody.querySelectorAll("[data-pat-row]").forEach(function (tr) {
-        tr.addEventListener("click", function () {
+        const activateRow = function () {
           STATE.selectedPatientId = tr.getAttribute("data-pat-row");
           renderTrialSelection();
+        };
+        tr.addEventListener("click", activateRow);
+        tr.addEventListener("keydown", function (ev) {
+          if (ev.key === "Enter" || ev.key === " ") {
+            ev.preventDefault();
+            activateRow();
+          }
         });
       });
 
@@ -1799,7 +2046,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
           return (
             "<tr>" +
             '<td class="mono">' + escHtml(c.criterion_id) + "</td>" +
-            '<td><span class="badge ' + bCls + '">' + escHtml(c.status) + "</span></td>" +
+            '<td><span class="badge ' + bCls + '">[' + escHtml(c.status) + "]</span></td>" +
             '<td class="mono">' + escHtml(c.observed) + "</td>" +
             "<td>" + escHtml(c.requirement) + "</td>" +
             "</tr>"
@@ -1807,8 +2054,8 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         }).join("");
       }
 
-      draw3DBiomarkerCanvas();
-      drawNodeMapCanvas();
+      draw3DBiomarkerPlot();
+      drawNodeMapPlot();
     }
 
     /* --- VIEW 5: CONVERSATIONAL ANALYTICS & PROVENANCE --- */
@@ -1823,7 +2070,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 
         const cols = res.columns || [];
         document.getElementById("analytics-results-thead").innerHTML =
-          "<tr>" + cols.map(function (c) { return "<th>" + escHtml(c) + "</th>"; }).join("") + "</tr>";
+          "<tr>" + cols.map(function (c) { return '<th scope="col">' + escHtml(c) + "</th>"; }).join("") + "</tr>";
         document.getElementById("analytics-results-tbody").innerHTML = (res.rows || []).map(function (r) {
           return "<tr>" + cols.map(function (c) {
             const v = r[c];
@@ -1831,7 +2078,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
             return "<td" + cls + ">" + escHtml(v) + "</td>";
           }).join("") + "</tr>";
         }).join("");
-        drawAnalyticsCanvas(res);
+        drawAnalyticsPlot(res);
       }
 
       const prov = WORKSPACE.provenance;
@@ -1892,23 +2139,23 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     }
 
     /* =====================================================================
-       HTML5 CANVAS VISUALIZATION ENGINE (High-DPI, Theme-Aware, Interactive)
+       2D / 3D GRAPHICS VISUALIZATION ENGINE (High-DPI, Theme-Aware)
        ===================================================================== */
-    function setupCanvas(id) {
-      const canvas = document.getElementById(id);
-      if (!canvas || !canvas.parentElement) return null;
-      const rect = canvas.parentElement.getBoundingClientRect();
+    function setupPlotSurface(id) {
+      const surface = document.getElementById(id);
+      if (!surface || !surface.parentElement) return null;
+      const rect = surface.parentElement.getBoundingClientRect();
       const w = Math.max(260, Math.floor(rect.width));
       const h = Math.max(180, Math.floor(rect.height));
       const dpr = window.devicePixelRatio || 1;
-      if (canvas.width !== Math.floor(w * dpr) || canvas.height !== Math.floor(h * dpr)) {
-        canvas.width = Math.floor(w * dpr);
-        canvas.height = Math.floor(h * dpr);
+      if (surface.width !== Math.floor(w * dpr) || surface.height !== Math.floor(h * dpr)) {
+        surface.width = Math.floor(w * dpr);
+        surface.height = Math.floor(h * dpr);
       }
-      const ctx = canvas.getContext("2d");
+      const ctx = surface.getContext("2d");
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, w, h);
-      return { canvas: canvas, ctx: ctx, w: w, h: h };
+      return { canvas: surface, ctx: ctx, w: w, h: h };
     }
 
     function hexToRgb(hex) {
@@ -1938,8 +2185,8 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     }
 
     const heatmapCells = [];
-    function drawHeatmapCanvas() {
-      const stage = setupCanvas("canvas-heatmap");
+    function drawHeatmapPlot() {
+      const stage = setupPlotSurface("canvas-heatmap");
       if (!stage) return;
       const ctx = stage.ctx, w = stage.w, h = stage.h;
       const tk = themeTokens();
@@ -1995,8 +2242,8 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       });
     }
 
-    function drawSaeTrendCanvas() {
-      const stage = setupCanvas("canvas-sae-trend");
+    function drawSaeTrendPlot() {
+      const stage = setupPlotSurface("canvas-sae-trend");
       if (!stage) return;
       const ctx = stage.ctx, w = stage.w, h = stage.h;
       const tk = themeTokens();
@@ -2125,8 +2372,8 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     /* -------------------------------------------------------------------
        1. HISTORICAL 8-WEEK SITE SIGNAL TREND (Multi-Layer Telemetry Plot)
        ------------------------------------------------------------------- */
-    function drawSiteTrendCanvas(sig) {
-      const stage = setupCanvas("canvas-site-trend");
+    function drawSiteTrendPlot(sig) {
+      const stage = setupPlotSurface("canvas-site-trend");
       if (!stage || !sig) return;
       const ctx = stage.ctx, w = stage.w, h = stage.h;
       const tk = themeTokens();
@@ -2157,7 +2404,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         return padL + (idx / Math.max(1, n - 1)) * pw;
       }
 
-      /* Top KPI Summary Strip inside Canvas */
+      /* Top KPI Summary Strip inside Plot */
       const currVal = series[n - 1];
       const deltaVal = currVal - series[0];
       const deltaStr = (deltaVal >= 0 ? "+" : "") + deltaVal;
@@ -2339,8 +2586,8 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     /* -------------------------------------------------------------------
        2. 3D BIOMARKER & ORGAN-FUNCTION PROJECTION (Volumetric Cube Engine)
        ------------------------------------------------------------------- */
-    function draw3DBiomarkerCanvas() {
-      const stage = setupCanvas("canvas-3d-biomarker");
+    function draw3DBiomarkerPlot() {
+      const stage = setupPlotSurface("canvas-3d-biomarker");
       if (!stage) return;
       const ctx = stage.ctx, w = stage.w, h = stage.h;
       const tk = themeTokens();
@@ -2627,8 +2874,8 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       ctx.closePath();
     }
 
-    function drawNodeMapCanvas() {
-      const stage = setupCanvas("canvas-nodemap");
+    function drawNodeMapPlot() {
+      const stage = setupPlotSurface("canvas-nodemap");
       if (!stage) return;
       const ctx = stage.ctx, w = stage.w, h = stage.h;
       const tk = themeTokens();
@@ -2990,8 +3237,8 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       STATE.renderedEdges = edges;
     }
 
-    function drawAnalyticsCanvas(res) {
-      const stage = setupCanvas("canvas-analytics-chart");
+    function drawAnalyticsPlot(res) {
+      const stage = setupPlotSurface("canvas-analytics-chart");
       if (!stage || !res || !res.rows || !res.rows.length) return;
       const ctx = stage.ctx, w = stage.w, h = stage.h;
       const tk = themeTokens();
@@ -3047,18 +3294,18 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       });
     }
 
-    function redrawAllCanvases() {
+    function redrawAllPlots() {
       if (STATE.activeView === "portfolio") {
-        drawHeatmapCanvas();
-        drawSaeTrendCanvas();
+        drawHeatmapPlot();
+        drawSaeTrendPlot();
       } else if (STATE.activeView === "signal") {
         const sig = WORKSPACE.signals.find(function (s) { return s.signal_id === STATE.selectedSignalId; });
-        drawSiteTrendCanvas(sig);
+        drawSiteTrendPlot(sig);
       } else if (STATE.activeView === "selection") {
-        draw3DBiomarkerCanvas();
-        drawNodeMapCanvas();
+        draw3DBiomarkerPlot();
+        drawNodeMapPlot();
       } else if (STATE.activeView === "analytics") {
-        drawAnalyticsCanvas(STATE.activeAnalyticsResult);
+        drawAnalyticsPlot(STATE.activeAnalyticsResult);
       }
     }
 
@@ -3070,7 +3317,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       else if (STATE.activeView === "analytics") renderAnalyticsView();
     }
 
-    /* --- INTERACTIVE CANVAS MOUSE HANDLERS --- */
+    /* --- INTERACTIVE PLOT MOUSE HANDLERS --- */
     const tooltip = document.getElementById("canvas-tooltip");
     function showTip(ev, text) {
       tooltip.style.display = "block";
@@ -3083,24 +3330,24 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     function hideTip() { tooltip.style.display = "none"; }
 
     /* Heatmap Hover & Click */
-    const hmCanvas = document.getElementById("canvas-heatmap");
-    hmCanvas.addEventListener("mousemove", function (ev) {
-      const rect = hmCanvas.getBoundingClientRect();
+    const hmPlot = document.getElementById("canvas-heatmap");
+    hmPlot.addEventListener("mousemove", function (ev) {
+      const rect = hmPlot.getBoundingClientRect();
       const mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
       const hit = heatmapCells.find(function (c) {
         return mx >= c.x && mx <= c.x + c.w && my >= c.y && my <= c.y + c.h;
       });
       if (hit) {
-        hmCanvas.style.cursor = "pointer";
+        hmPlot.style.cursor = "pointer";
         showTip(ev, hit.site_id + " (" + hit.site_name + ")\\nFamily: " + hit.family + " | Signals: " + hit.count + " | Weight: " + hit.weight);
       } else {
-        hmCanvas.style.cursor = "default";
+        hmPlot.style.cursor = "default";
         hideTip();
       }
     });
-    hmCanvas.addEventListener("mouseleave", hideTip);
-    hmCanvas.addEventListener("click", function (ev) {
-      const rect = hmCanvas.getBoundingClientRect();
+    hmPlot.addEventListener("mouseleave", hideTip);
+    hmPlot.addEventListener("click", function (ev) {
+      const rect = hmPlot.getBoundingClientRect();
       const mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
       const hit = heatmapCells.find(function (c) {
         return mx >= c.x && mx <= c.x + c.w && my >= c.y && my <= c.y + c.h;
@@ -3126,7 +3373,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         if (STATE.hoveredTrendIdx !== best.idx) {
           STATE.hoveredTrendIdx = best.idx;
           const sig = WORKSPACE.signals.find(function (s) { return s.signal_id === STATE.selectedSignalId; });
-          drawSiteTrendCanvas(sig);
+          drawSiteTrendPlot(sig);
         }
         const diff = (best.val - best.peer).toFixed(1);
         showTip(
@@ -3144,7 +3391,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       STATE.hoveredTrendIdx = -1;
       hideTip();
       const sig = WORKSPACE.signals.find(function (s) { return s.signal_id === STATE.selectedSignalId; });
-      drawSiteTrendCanvas(sig);
+      drawSiteTrendPlot(sig);
     });
 
     /* 3D Biomarker Cube Orbit, Zoom, Presets, Auto-Orbit & Hover */
@@ -3162,7 +3409,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       if (!STATE.autoOrbit3d) { orbitAnimId = null; return; }
       if (STATE.activeView === "selection" && !drag3d) {
         STATE.rot3dYaw += 0.0045;
-        draw3DBiomarkerCanvas();
+        draw3DBiomarkerPlot();
       }
       orbitAnimId = window.requestAnimationFrame(stepAutoOrbit);
     }
@@ -3178,14 +3425,14 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       STATE.rot3dYaw += dx * 0.01;
       STATE.rot3dPitch = Math.max(-1.25, Math.min(1.25, STATE.rot3dPitch + dy * 0.01));
       drag3d.x = ev.clientX; drag3d.y = ev.clientY;
-      draw3DBiomarkerCanvas();
+      draw3DBiomarkerPlot();
     });
     window.addEventListener("mouseup", function () { drag3d = null; });
 
     c3d.addEventListener("wheel", function (ev) {
       ev.preventDefault();
       STATE.zoom3d = Math.max(0.65, Math.min(2.15, STATE.zoom3d * (ev.deltaY < 0 ? 1.08 : 0.92)));
-      draw3DBiomarkerCanvas();
+      draw3DBiomarkerPlot();
     }, { passive: false });
 
     c3d.addEventListener("mousemove", function (ev) {
@@ -3200,7 +3447,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       const nextHov = hit ? hit.pat.patient_id : null;
       if (STATE.hovered3dId !== nextHov) {
         STATE.hovered3dId = nextHov;
-        draw3DBiomarkerCanvas();
+        draw3DBiomarkerPlot();
       }
       if (hit) {
         c3d.style.cursor = "pointer";
@@ -3220,7 +3467,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     c3d.addEventListener("mouseleave", function () {
       if (STATE.hovered3dId !== null) {
         STATE.hovered3dId = null;
-        draw3DBiomarkerCanvas();
+        draw3DBiomarkerPlot();
       }
       hideTip();
     });
@@ -3245,23 +3492,25 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         if (preset === "iso") { STATE.rot3dYaw = 0.64; STATE.rot3dPitch = 0.38; }
         else if (preset === "xy") { STATE.rot3dYaw = 0.0; STATE.rot3dPitch = 0.04; }
         else if (preset === "top") { STATE.rot3dYaw = 0.35; STATE.rot3dPitch = 1.18; }
-        draw3DBiomarkerCanvas();
+        draw3DBiomarkerPlot();
       });
     });
     document.getElementById("btn-3d-orbit").addEventListener("click", function (ev) {
       STATE.autoOrbit3d = !STATE.autoOrbit3d;
       ev.currentTarget.classList.toggle("active", STATE.autoOrbit3d);
+      ev.currentTarget.setAttribute("aria-pressed", STATE.autoOrbit3d ? "true" : "false");
       if (STATE.autoOrbit3d && !orbitAnimId) stepAutoOrbit();
     });
     document.getElementById("btn-3d-envelope").addEventListener("click", function (ev) {
       STATE.show3dEnvelope = !STATE.show3dEnvelope;
       ev.currentTarget.classList.toggle("active", STATE.show3dEnvelope);
-      draw3DBiomarkerCanvas();
+      ev.currentTarget.setAttribute("aria-pressed", STATE.show3dEnvelope ? "true" : "false");
+      draw3DBiomarkerPlot();
     });
     document.getElementById("btn-3d-reset").addEventListener("click", function () {
       STATE.rot3dYaw = 0.64; STATE.rot3dPitch = 0.38; STATE.zoom3d = 1.0;
       syncCamPresetButtons("iso");
-      draw3DBiomarkerCanvas();
+      draw3DBiomarkerPlot();
     });
 
     /* Node Map Pan, Zoom, Spotlight Hover, Layer Modes & Drill-Down */
@@ -3277,13 +3526,13 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       STATE.nodePanX += dx;
       STATE.nodePanY += dy;
       dragNode.x = ev.clientX; dragNode.y = ev.clientY;
-      drawNodeMapCanvas();
+      drawNodeMapPlot();
     });
     window.addEventListener("mouseup", function () { dragNode = null; });
     cNode.addEventListener("wheel", function (ev) {
       ev.preventDefault();
       STATE.nodeZoom = Math.max(0.55, Math.min(2.4, STATE.nodeZoom * (ev.deltaY < 0 ? 1.10 : 0.91)));
-      drawNodeMapCanvas();
+      drawNodeMapPlot();
     }, { passive: false });
 
     cNode.addEventListener("mousemove", function (ev) {
@@ -3298,7 +3547,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       const nextId = hit ? hit.id : null;
       if (STATE.hoveredNodeId !== nextId) {
         STATE.hoveredNodeId = nextId;
-        drawNodeMapCanvas();
+        drawNodeMapPlot();
       }
       if (hit) {
         cNode.style.cursor = "pointer";
@@ -3311,7 +3560,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     cNode.addEventListener("mouseleave", function () {
       if (STATE.hoveredNodeId !== null) {
         STATE.hoveredNodeId = null;
-        drawNodeMapCanvas();
+        drawNodeMapPlot();
       }
       hideTip();
     });
@@ -3343,22 +3592,24 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       btn.addEventListener("click", function () {
         STATE.nodeLayerMode = btn.getAttribute("data-nodelayer");
         document.querySelectorAll("[data-nodelayer]").forEach(function (b) {
-          b.classList.toggle("active", b === btn);
+          const isAct = b === btn;
+          b.classList.toggle("active", isAct);
+          b.setAttribute("aria-pressed", isAct ? "true" : "false");
         });
-        drawNodeMapCanvas();
+        drawNodeMapPlot();
       });
     });
     document.getElementById("btn-nodemap-zin").addEventListener("click", function () {
       STATE.nodeZoom = Math.min(2.4, STATE.nodeZoom * 1.18);
-      drawNodeMapCanvas();
+      drawNodeMapPlot();
     });
     document.getElementById("btn-nodemap-zout").addEventListener("click", function () {
       STATE.nodeZoom = Math.max(0.55, STATE.nodeZoom * 0.84);
-      drawNodeMapCanvas();
+      drawNodeMapPlot();
     });
     document.getElementById("btn-reset-nodemap").addEventListener("click", function () {
       STATE.nodePanX = 0; STATE.nodePanY = 0; STATE.nodeZoom = 1.0;
-      drawNodeMapCanvas();
+      drawNodeMapPlot();
     });
 
     /* --- UI CONTROLS WIRING --- */
@@ -3384,11 +3635,18 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     });
 
     document.querySelectorAll("#portfolio-sites-table th[data-sort]").forEach(function (th) {
-      th.addEventListener("click", function () {
+      const toggleSort = function () {
         const col = th.getAttribute("data-sort");
         if (STATE.sortCol === col) STATE.sortDesc = !STATE.sortDesc;
         else { STATE.sortCol = col; STATE.sortDesc = true; }
         renderPortfolio();
+      };
+      th.addEventListener("click", toggleSort);
+      th.addEventListener("keydown", function (ev) {
+        if (ev.key === "Enter" || ev.key === " ") {
+          ev.preventDefault();
+          toggleSort();
+        }
       });
     });
 
@@ -3397,13 +3655,29 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       STATE.checkedSignalIds = new Set();
       renderSingleSite();
     });
-    document.querySelectorAll("[data-site-subtab]").forEach(function (btn) {
-      btn.addEventListener("click", function () {
-        STATE.siteSubtab = btn.getAttribute("data-site-subtab");
-        document.querySelectorAll("[data-site-subtab]").forEach(function (b) {
-          b.classList.toggle("active", b === btn);
-        });
-        renderSingleSite();
+    const siteSubtabs = Array.prototype.slice.call(document.querySelectorAll("[data-site-subtab]"));
+    function activateSiteSubtab(btn) {
+      STATE.siteSubtab = btn.getAttribute("data-site-subtab");
+      siteSubtabs.forEach(function (b) {
+        const isAct = b === btn;
+        b.classList.toggle("active", isAct);
+        b.setAttribute("aria-selected", isAct ? "true" : "false");
+      });
+      renderSingleSite();
+    }
+    siteSubtabs.forEach(function (btn, idx) {
+      btn.addEventListener("click", function () { activateSiteSubtab(btn); });
+      btn.addEventListener("keydown", function (ev) {
+        let nextIdx = null;
+        if (ev.key === "ArrowRight") nextIdx = (idx + 1) % siteSubtabs.length;
+        else if (ev.key === "ArrowLeft") nextIdx = (idx - 1 + siteSubtabs.length) % siteSubtabs.length;
+        else if (ev.key === "Home") nextIdx = 0;
+        else if (ev.key === "End") nextIdx = siteSubtabs.length - 1;
+        if (nextIdx !== null) {
+          ev.preventDefault();
+          siteSubtabs[nextIdx].focus();
+          activateSiteSubtab(siteSubtabs[nextIdx]);
+        }
       });
     });
     document.getElementById("btn-generate-agenda").addEventListener("click", function () {
@@ -3461,7 +3735,38 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       navigator.clipboard && navigator.clipboard.writeText(document.getElementById("analytics-sql-output").textContent);
     });
 
-    window.addEventListener("resize", redrawAllCanvases);
+    /* --- LOCAL BROWSER DATA PORTABILITY & ERASURE CONTROLS --- */
+    document.getElementById("btn-export-local-data").addEventListener("click", function () {
+      const payload = {
+        exported_at: new Date().toISOString(),
+        theme_mode: readStorage("ctw_theme_mode", "system"),
+        hitl_feedback: readJsonStorage("ctw_hitl_feedback", {})
+      };
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "workbench-local-data.json";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    });
+
+    document.getElementById("btn-clear-local-data").addEventListener("click", function () {
+      removeStorage("ctw_hitl_feedback");
+      removeStorage("ctw_theme_mode");
+      STATE.localFeedback = {};
+      WORKSPACE.signals.forEach(function (sig) {
+        const serverFb = (WORKSPACE.feedback_state || {})[sig.signal_id];
+        sig.disposition = serverFb ? serverFb.disposition : "PENDING_REVIEW";
+        sig.reviewer_note = serverFb ? (serverFb.note || "") : "";
+      });
+      applyThemeMode("system");
+      renderActiveView();
+    });
+
+    window.addEventListener("resize", redrawAllPlots);
 
     /* --- OPTIONAL LIVE SSE STREAMING (DESIGN.md Section 2) --- */
     if (window.location.protocol.startsWith("http") && typeof EventSource !== "undefined") {
@@ -3469,14 +3774,19 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         const es = new EventSource("/events");
         es.addEventListener("open", function () {
           const b = document.getElementById("telemetry-status-badge");
-          b.textContent = "SSE Live Connected";
+          b.textContent = "[LIVE SSE] Connected";
           b.className = "badge badge-emerald mono";
         });
         es.addEventListener("workspace_update", function (ev) {
-          const updated = JSON.parse(ev.data);
-          WORKSPACE = updated;
-          syncLocalFeedback();
-          renderActiveView();
+          try {
+            const updated = JSON.parse(ev.data);
+            if (!updated || typeof updated !== "object" || !Array.isArray(updated.sites) || !Array.isArray(updated.signals)) {
+              return;
+            }
+            WORKSPACE = updated;
+            syncLocalFeedback();
+            renderActiveView();
+          } catch (parseErr) {}
         });
       } catch (e) {}
     }
@@ -3505,6 +3815,24 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 """
 
 
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Write text atomically via same-directory temporary file and os.replace."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
 def build_standalone_dashboard(
     output_path: str | Path | None = None,
     data_dir: str | Path | None = None,
@@ -3521,10 +3849,16 @@ def build_standalone_dashboard(
     bundle = compile_workspace_bundle(
         data_dir=data_dir, state_file=state_file, strict=strict
     )
-    # Escape closing script tags safely for inline embedding
-    json_payload = json.dumps(bundle, separators=(",", ":")).replace("</", "<\\/")
+    # Escape closing script tags, HTML comments, and JS line separators safely for inline embedding
+    json_payload = (
+        json.dumps(bundle, separators=(",", ":"))
+        .replace("</", "<\\/")
+        .replace("<!--", "<\\!--")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
     html_text = DASHBOARD_HTML_TEMPLATE.replace("__WORKSPACE_JSON_PAYLOAD__", json_payload)
-    out.write_text(html_text, encoding="utf-8")
+    _atomic_write_text(out, html_text)
 
     logger.info("Emitted standalone dashboard to %s (%d bytes)", out, len(html_text))
     return {

@@ -14,6 +14,8 @@ PROJECT_ROOT: Path = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_DIR: Path = PROJECT_ROOT / "assets" / "synthetic_data"
 DEFAULT_SCHEMAS_DIR: Path = PROJECT_ROOT / "assets" / "schemas"
 DEFAULT_TEMPLATES_DIR: Path = PROJECT_ROOT / "assets" / "templates"
+DEFAULT_FONTS_DIR: Path = PROJECT_ROOT / "assets" / "fonts"
+DEFAULT_LEGAL_DIR: Path = PROJECT_ROOT / "legal"
 DEFAULT_STATE_FILE: Path = PROJECT_ROOT / "assets" / "workbench_feedback_state.json"
 DEFAULT_DASHBOARD_PATH: Path = PROJECT_ROOT / "dashboard.html"
 

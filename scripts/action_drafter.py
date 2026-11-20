@@ -10,7 +10,10 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
+import re
+import tempfile
 from typing import Any
 
 from scripts import (
@@ -22,6 +25,28 @@ from scripts import (
 )
 
 VALID_DISPOSITIONS = frozenset({"ACCEPT", "MODIFY", "DISMISS", "PENDING_REVIEW"})
+SIGNAL_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+REVIEWER_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+MAX_FEEDBACK_NOTE_LENGTH = 2000
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    """Write JSON atomically via same-directory temporary file and os.replace."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    serialized = json.dumps(payload, indent=2) + "\n"
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def load_feedback_state(
@@ -57,24 +82,85 @@ def record_signal_feedback(
     state_file: str | Path | None = None,
 ) -> dict[str, Any]:
     """Persist human reviewer disposition (ACCEPT, MODIFY, DISMISS) for a signal."""
+    clean_signal_id = signal_id.strip()
+    if not SIGNAL_ID_PATTERN.match(clean_signal_id):
+        raise ValueError("Invalid signal_id format.")
     disp_upper = disposition.strip().upper()
     if disp_upper not in VALID_DISPOSITIONS:
         raise ValueError(
             f"Invalid disposition '{disposition}'. Allowed values: {sorted(VALID_DISPOSITIONS)}"
         )
+    clean_note = note.strip()
+    if len(clean_note) > MAX_FEEDBACK_NOTE_LENGTH:
+        raise ValueError(
+            f"Reviewer note exceeds maximum length ({MAX_FEEDBACK_NOTE_LENGTH} characters)."
+        )
+    clean_reviewer = reviewer_id.strip() or "CRA-01"
+    if not REVIEWER_ID_PATTERN.match(clean_reviewer):
+        raise ValueError("Invalid reviewer_id format.")
+
     path = resolve_state_file(state_file)
-    path.parent.mkdir(parents=True, exist_ok=True)
     current = load_feedback_state(path, strict=False)
     entry = {
-        "signal_id": signal_id,
+        "signal_id": clean_signal_id,
         "disposition": disp_upper,
-        "note": note.strip(),
-        "reviewer_id": reviewer_id.strip() or "CRA-01",
+        "note": clean_note,
+        "reviewer_id": clean_reviewer,
         "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
-    current[signal_id] = entry
-    path.write_text(json.dumps({"signals": current}, indent=2) + "\n", encoding="utf-8")
+    current[clean_signal_id] = entry
+    _atomic_write_json(path, {"signals": current})
     return entry
+
+
+def export_reviewer_data(
+    reviewer_id: str,
+    state_file: str | Path | None = None,
+) -> dict[str, Any]:
+    """Export all persisted feedback records owned by a specific reviewer in machine-readable JSON."""
+    clean_reviewer = reviewer_id.strip()
+    if not REVIEWER_ID_PATTERN.match(clean_reviewer):
+        raise ValueError("Invalid reviewer_id format.")
+    current = load_feedback_state(state_file, strict=False)
+    records = [
+        entry
+        for entry in current.values()
+        if isinstance(entry, dict) and str(entry.get("reviewer_id", "")) == clean_reviewer
+    ]
+    records.sort(key=lambda r: str(r.get("signal_id", "")))
+    return {
+        "exported_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "reviewer_id": clean_reviewer,
+        "record_count": len(records),
+        "feedback_records": records,
+    }
+
+
+def delete_reviewer_data(
+    reviewer_id: str,
+    state_file: str | Path | None = None,
+) -> dict[str, Any]:
+    """Permanently purge all persisted feedback records owned by a specific reviewer."""
+    clean_reviewer = reviewer_id.strip()
+    if not REVIEWER_ID_PATTERN.match(clean_reviewer):
+        raise ValueError("Invalid reviewer_id format.")
+    path = resolve_state_file(state_file)
+    current = load_feedback_state(path, strict=False)
+    retained: dict[str, dict[str, Any]] = {}
+    purged_signal_ids: list[str] = []
+    for sig_id, entry in current.items():
+        if isinstance(entry, dict) and str(entry.get("reviewer_id", "")) == clean_reviewer:
+            purged_signal_ids.append(sig_id)
+        else:
+            retained[sig_id] = entry
+    if purged_signal_ids or path.exists():
+        _atomic_write_json(path, {"signals": retained})
+    return {
+        "deleted_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "reviewer_id": clean_reviewer,
+        "purged_count": len(purged_signal_ids),
+        "purged_signal_ids": sorted(purged_signal_ids),
+    }
 
 
 def build_portfolio_executive_briefing(

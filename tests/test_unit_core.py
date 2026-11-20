@@ -16,7 +16,12 @@ from scripts import (
     SQLSafetyError,
     StateFileError,
 )
-from scripts.action_drafter import load_feedback_state, record_signal_feedback
+from scripts.action_drafter import (
+    delete_reviewer_data,
+    export_reviewer_data,
+    load_feedback_state,
+    record_signal_feedback,
+)
 from scripts.analytics_assistant import answer_analytics_question, validate_readonly_sql
 from scripts.data_ingestor import PIIGuardrailScanner, ingest_workspace_data
 from scripts.generate_synthetic_data import generate_all_synthetic_data
@@ -51,6 +56,13 @@ class TestPIIGuardrails(unittest.TestCase):
         self.assertIn("telephone", joined)
         self.assertIn("gmail.com", joined)
         self.assertIn("patient_name", joined)
+
+    def test_non_numeric_age_redacts_raw_value(self) -> None:
+        bad = {"patient_id": "PAT-99998", "age_years": "SENSITIVE-RAW-TOKEN"}
+        violations = PIIGuardrailScanner.scan_record("ehr.csv", "PAT-99998", bad)
+        self.assertEqual(len(violations), 1)
+        self.assertIn("[REDACTED]", violations[0])
+        self.assertNotIn("SENSITIVE-RAW-TOKEN", violations[0])
 
 
 class TestIngestionEdgeCases(unittest.TestCase):
@@ -170,7 +182,7 @@ class TestTrialSelectionAndSignalEngines(unittest.TestCase):
 
 
 class TestSQLSandboxingAndFeedbackState(unittest.TestCase):
-    """Verify two-layer read-only SQLite guardrails and HITL feedback recovery."""
+    """Verify multi-layer read-only SQLite guardrails, HITL recovery, and reviewer data rights."""
 
     def setUp(self) -> None:
         self.conn, _ = ingest_workspace_data(strict=True)
@@ -196,6 +208,18 @@ class TestSQLSandboxingAndFeedbackState(unittest.TestCase):
                 validate_readonly_sql(bad_sql)
             with self.assertRaises(SQLSafetyError):
                 answer_analytics_question(self.conn, custom_sql=bad_sql)
+
+    def test_authorizer_blocks_catalog_blob_dos_and_recursive_cte(self) -> None:
+        dos_and_meta_queries = [
+            "SELECT name FROM sqlite_master",
+            "SELECT randomblob(1000000)",
+            "SELECT zeroblob(1000000)",
+            "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt LIMIT 1000000) SELECT COUNT(*) FROM cnt",
+            "SELECT " + ("1 + " * 1200) + "1",
+        ]
+        for query in dos_and_meta_queries:
+            with self.assertRaises(SQLSafetyError, msg=f"Failed to block: {query[:60]}"):
+                answer_analytics_question(self.conn, custom_sql=query)
 
     def test_valid_nl_and_custom_select_queries_succeed(self) -> None:
         res_nl = answer_analytics_question(
@@ -226,6 +250,24 @@ class TestSQLSandboxingAndFeedbackState(unittest.TestCase):
             self.assertEqual(saved["disposition"], "ACCEPT")
             reloaded = load_feedback_state(state_path, strict=True)
             self.assertEqual(reloaded["SIG-1001"]["note"], "Verified with PI")
+
+    def test_reviewer_data_export_and_erasure_isolation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            record_signal_feedback("SIG-1001", "ACCEPT", note="CRA-01 note", reviewer_id="CRA-01", state_file=state_path)
+            record_signal_feedback("SIG-1002", "MODIFY", note="CRA-02 note", reviewer_id="CRA-02", state_file=state_path)
+
+            exp_1 = export_reviewer_data("CRA-01", state_file=state_path)
+            self.assertEqual(exp_1["record_count"], 1)
+            self.assertEqual(exp_1["feedback_records"][0]["signal_id"], "SIG-1001")
+
+            del_1 = delete_reviewer_data("CRA-01", state_file=state_path)
+            self.assertEqual(del_1["purged_count"], 1)
+            self.assertEqual(del_1["purged_signal_ids"], ["SIG-1001"])
+
+            remaining = load_feedback_state(state_path, strict=True)
+            self.assertNotIn("SIG-1001", remaining)
+            self.assertIn("SIG-1002", remaining)
 
 
 if __name__ == "__main__":

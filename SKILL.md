@@ -12,7 +12,7 @@ description: >-
 
 ## 1. Purpose and Operational Model
 
-This skill equips an AI agent to act as an enterprise Clinical Operations "System of Action" and Clinical Trial Selection coordinator over multi-source clinical feeds. It executes a four-stage **Listen -> Detect -> Assess -> Action** workflow paired with deterministic **Patient-to-Trial Eligibility Matching** and an interactive HTML5 Canvas UI (`dashboard.html`).
+This skill equips an AI agent to act as a Clinical Operations "System of Action" and Clinical Trial Selection coordinator over multi-source clinical feeds. It executes a four-stage **Listen -> Detect -> Assess -> Action** workflow paired with deterministic **Patient-to-Trial Eligibility Matching** and an interactive 2D/3D web dashboard (`dashboard.html`).
 
 All commands execute relative to the skill root directory using `python3 scripts/workbench_cli.py` and operate strictly on de-identified, HIPAA Safe Harbor-compliant data.
 
@@ -107,7 +107,7 @@ python3 scripts/workbench_cli.py ask --sql "SELECT site_id, protocol_code, max_q
 
 **Transparency Mandate:** Always surface four elements to the user: (1) narrative synthesis, (2) exact executed SQL query, (3) underlying tabular rows, and (4) originating source files.
 
-### Runbook G: Build or Serve the Interactive HTML5 Canvas Workbench (`dashboard.html`)
+### Runbook G: Build or Serve the Interactive 2D/3D Workbench (`dashboard.html`)
 Whenever the user requests a visual UI, interactive charts, 3D biomarker exploration, or network relationship views, generate `dashboard.html` at the project root:
 
 ```bash
@@ -125,4 +125,4 @@ python3 scripts/workbench_cli.py serve --host 127.0.0.1 --port 8765
 1. **HCLS Privacy Compliance:** Never introduce real or realistic patient names, SSNs, phone numbers, street addresses, dates of birth, or ages above 89 into custom data files or prompts. If `PIIComplianceViolationError` (exit code `3`) occurs under `--strict`, halt processing and alert the operator.
 2. **Read-Only Source Integrity:** Phase 1 operates strictly read-only against source clinical feeds. Never attempt `INSERT`, `UPDATE`, `DELETE`, or `DROP` statements via `ask --sql` (`SQLSafetyError`, exit code `4`).
 3. **Human Decision Authority:** All drafted visit agendas, site follow-up emails, trial referrals, and CAPA issue exports must remain subject to explicit human review before clinical or regulatory action.
-4. **Professional Clinical Tone:** Present outputs in clean markdown tables and concise technical prose without emojis or decorative icons.
+4. **Clinical Output Formatting:** Present outputs in structured markdown tables and concise technical prose.
