@@ -17,6 +17,7 @@ Pharmaceutical and clinical research organizations frequently manage clinical tr
 
 ```text
 clinical-trials-workbench-skill/
+|-- .gitignore                                 # Repository ignore rules for artifacts, caches, and secrets
 |-- DESIGN.md                                  # Visual and technical UI design specification
 |-- LICENSE                                    # Apache License, Version 2.0
 |-- README.md                                  # Setup, CLI execution, and end-user guide
@@ -26,6 +27,16 @@ clinical-trials-workbench-skill/
 |-- requirements.txt                           # Python test dependency specification
 |-- assets/
 |   |-- fonts/                                 # Self-hosted SIL OFL 1.1 WOFF2 fonts and license attribution
+|   |   |-- LICENSES.txt
+|   |   |-- dm-sans-400.woff2
+|   |   |-- dm-sans-500.woff2
+|   |   |-- dm-sans-600.woff2
+|   |   |-- dm-sans-700.woff2
+|   |   |-- ibm-plex-mono-400.woff2
+|   |   |-- ibm-plex-mono-500.woff2
+|   |   |-- ibm-plex-mono-600.woff2
+|   |   |-- instrument-serif-400-italic.woff2
+|   |   `-- instrument-serif-400.woff2
 |   |-- images/
 |   |   `-- clinical_trials_workbench_overview.png
 |   |-- schemas/
@@ -140,7 +151,7 @@ python3 scripts/workbench_cli.py serve --host 127.0.0.1 --port 8765
 - `CTW_DATA_DIR`: Relative or custom path to the 10-feed clinical dataset directory (default: `assets/synthetic_data`).
 - `CTW_STATE_FILE`: Path to persisted reviewer feedback JSON file (default: `assets/workbench_feedback_state.json`).
 - `CTW_API_TOKEN`: Optional Bearer token enforced via constant-time verification on `/api/*` and `/events`. Required automatically if `--host` is set to a non-loopback address and always required for `/api/user-data/export` and `/api/user-data/delete`.
-- `CTW_AUTHENTICATED_REVIEWER`: Optional server-pinned reviewer ID enforced against owner-scoped data portability and erasure requests.
+- `CTW_AUTHENTICATED_REVIEWER`: Server-pinned reviewer ID required alongside `CTW_API_TOKEN` to authorize owner-scoped data portability (`/api/user-data/export`) and erasure (`/api/user-data/delete`) requests (and to pin feedback writes).
 
 Draft legal policy pages are served locally at `/privacy`, `/terms`, `/refunds`, and `/cookies` from `legal/*.md` (`DRAFT — REQUIRES LEGAL REVIEW`).
 

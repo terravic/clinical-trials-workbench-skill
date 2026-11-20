@@ -28,6 +28,17 @@ DISALLOWED_SQLITE_FUNCTIONS = frozenset(
         "load_extension",
         "randomblob",
         "zeroblob",
+        "printf",
+        "format",
+        "readfile",
+        "writefile",
+        "edit",
+        "fts3_tokenizer",
+        "sqlite_version",
+        "sqlite_source_id",
+        "sqlite_compileoption_get",
+        "sqlite_compileoption_used",
+        "sqlite_offset",
     }
 )
 
@@ -405,10 +416,13 @@ def answer_analytics_question(
     if not prompt_text:
         raise ValueError("Either 'question' or 'custom_sql' must be provided.")
 
-    # Allow user to type SELECT directly in question box as well
-    if re.match(r"^(SELECT|WITH)\b", prompt_text, flags=re.IGNORECASE) or FORBIDDEN_SQL_TOKENS.search(prompt_text):
-        if re.match(r"^(SELECT|WITH|INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|PRAGMA|ATTACH)\b", prompt_text, flags=re.IGNORECASE):
-            return answer_analytics_question(conn, question="Direct SQL Input", custom_sql=prompt_text)
+    # Allow user to type SELECT directly in question box and reject raw mutating statements consistently
+    if re.match(
+        r"^(SELECT|WITH|INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|REPLACE|TRUNCATE|ATTACH|DETACH|PRAGMA|VACUUM|REINDEX|BEGIN|COMMIT|ROLLBACK)\b",
+        prompt_text,
+        flags=re.IGNORECASE,
+    ):
+        return answer_analytics_question(conn, question="Direct SQL Input", custom_sql=prompt_text)
 
     tpl = _select_intent(prompt_text)
     clean_sql = "\n".join(line.rstrip() for line in tpl["sql"].strip().splitlines())

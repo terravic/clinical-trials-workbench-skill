@@ -100,7 +100,7 @@ class TestPIIGuardrails(unittest.TestCase):
         self.assertEqual(PIIGuardrailScanner.scan_record("t.csv", 6, cases[5]), [])      # near-miss lengths ok
         self.assertEqual(len(PIIGuardrailScanner.scan_record("t.csv", 7, cases[6])), 1)  # forbidden header
 
-        # Verify scalar fast-skip and nested dict/list recursion
+        # Verify scalar fast-skip and nested dict/list recursion (values, forbidden keys, and age)
         nested = {
             "count": 42,
             "ratio": 1.25,
@@ -109,6 +109,15 @@ class TestPIIGuardrails(unittest.TestCase):
         }
         v_nested = PIIGuardrailScanner.scan_record("nested.json", "N-1", nested)
         self.assertEqual(len(v_nested), 2)
+
+        nested_keys = {
+            "wrapper": [{"patient_name": "Hidden Subject", "age_years": 95}],
+        }
+        v_nested_keys = PIIGuardrailScanner.scan_record("nested.json", "N-2", nested_keys)
+        self.assertEqual(len(v_nested_keys), 2)
+        joined_nested = " | ".join(v_nested_keys)
+        self.assertIn("patient_name", joined_nested)
+        self.assertIn("Safe Harbor", joined_nested)
 
 
 class TestIngestionEdgeCases(unittest.TestCase):
@@ -307,12 +316,36 @@ class TestSQLSandboxingAndFeedbackState(unittest.TestCase):
             "SELECT name FROM sqlite_master",
             "SELECT randomblob(1000000)",
             "SELECT zeroblob(1000000)",
+            "SELECT printf('%1000000s', 'a')",
+            "SELECT format('%1000000s', 'a')",
+            "SELECT sqlite_version()",
+            "SELECT sqlite_source_id()",
+            "SELECT sqlite_compileoption_get(0)",
             "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt LIMIT 1000000) SELECT COUNT(*) FROM cnt",
             "SELECT " + ("1 + " * 1200) + "1",
         ]
         for query in dos_and_meta_queries:
             with self.assertRaises(SQLSafetyError, msg=f"Failed to block: {query[:60]}"):
                 answer_analytics_question(self.conn, custom_sql=query)
+
+        # Direct mutating/maintenance SQL statements entered in natural-language box must be rejected
+        for raw_stmt in ("VACUUM", "REPLACE INTO studies VALUES ('X','X','X','X','X',1,'v1',7,28)", "DETACH DATABASE main"):
+            with self.assertRaises(SQLSafetyError, msg=f"Failed to reject question SQL: {raw_stmt}"):
+                answer_analytics_question(self.conn, question=raw_stmt)
+
+    def test_inline_json_escaping_preserves_valid_json(self) -> None:
+        from scripts.build_dashboard import _escape_inline_json, serialize_bundle_json
+
+        payload = {
+            "note": "<!-- html comment --> </script><script>alert(1)</script>",
+            "sep": "line1\u2028line2\u2029line3",
+        }
+        escaped = _escape_inline_json(serialize_bundle_json(payload))
+        self.assertNotIn("<!--", escaped)
+        self.assertNotIn("</script>", escaped)
+        self.assertNotIn("<", escaped)
+        self.assertNotIn(">", escaped)
+        self.assertEqual(json.loads(escaped), payload)
 
     def test_valid_nl_and_custom_select_queries_succeed(self) -> None:
         res_nl = answer_analytics_question(

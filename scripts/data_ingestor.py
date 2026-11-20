@@ -167,22 +167,61 @@ class PIIGuardrailScanner:
         return violations
 
     @classmethod
-    def scan_record(cls, source_name: str, record_id: str, payload: dict[str, Any]) -> list[str]:
-        """Return list of human-readable compliance violation messages (empty if clean)."""
-        violations: list[str] = []
-        forbidden = cls.FORBIDDEN_PII_KEYS
-        ssn_search = cls.SSN_PATTERN.search
-        phone_search = cls.PHONE_PATTERN.search
-        email_finditer = cls.EMAIL_PATTERN.finditer
-        reserved_domains = _RESERVED_EMAIL_DOMAINS
+    def _scan_nested_value(
+        cls,
+        source_name: str,
+        record_id: str,
+        field_path: str,
+        raw_val: Any,
+        violations: list[str],
+    ) -> None:
+        if raw_val is None or isinstance(raw_val, (int, float, bool)):
+            return
+        if isinstance(raw_val, dict):
+            cls._scan_dict_recursive(source_name, record_id, raw_val, field_path, violations)
+            return
+        if isinstance(raw_val, (list, tuple)):
+            for idx, item in enumerate(raw_val):
+                item_path = f"{field_path}[{idx}]" if field_path else f"[{idx}]"
+                cls._scan_nested_value(source_name, record_id, item_path, item, violations)
+            return
+        text = raw_val if isinstance(raw_val, str) else str(raw_val)
+        tlen = len(text)
+        if tlen >= 11 and "-" in text and cls.SSN_PATTERN.search(text):
+            violations.append(
+                f"{source_name}[{record_id}].{field_path}: SSN-like pattern detected"
+            )
+        if tlen >= 12 and cls.PHONE_PATTERN.search(text):
+            violations.append(
+                f"{source_name}[{record_id}].{field_path}: telephone number pattern detected"
+            )
+        if "@" in text:
+            for match in cls.EMAIL_PATTERN.finditer(text):
+                domain = match.group(1).lower()
+                if not (domain.endswith(".example") or domain in _RESERVED_EMAIL_DOMAINS):
+                    violations.append(
+                        f"{source_name}[{record_id}].{field_path}: non-reserved email domain '{domain}' detected"
+                    )
 
+    @classmethod
+    def _scan_dict_recursive(
+        cls,
+        source_name: str,
+        record_id: str,
+        payload: dict[str, Any],
+        prefix: str,
+        violations: list[str],
+    ) -> None:
+        forbidden = cls.FORBIDDEN_PII_KEYS
         for raw_key, raw_val in payload.items():
             if raw_key is None:
                 continue
-            key_lower = raw_key.strip().lower() if isinstance(raw_key, str) else str(raw_key).strip().lower()
+            key_str = raw_key if isinstance(raw_key, str) else str(raw_key)
+            key_lower = key_str.strip().lower()
+            field_path = f"{prefix}.{key_str}" if prefix else key_str
             if key_lower in forbidden:
                 violations.append(
-                    f"{source_name}[{record_id}]: forbidden PII attribute '{raw_key}' detected"
+                    f"{source_name}[{record_id}]: forbidden PII attribute '{field_path}' detected"
                 )
             if raw_val is None:
                 continue
@@ -199,26 +238,13 @@ class PIIGuardrailScanner:
                         violations.append(
                             f"{source_name}[{record_id}]: non-numeric age_years=[REDACTED]"
                         )
+            cls._scan_nested_value(source_name, record_id, field_path, raw_val, violations)
 
-            if isinstance(raw_val, (int, float, bool)):
-                continue
-            text = raw_val if isinstance(raw_val, str) else str(raw_val)
-            tlen = len(text)
-            if tlen >= 11 and "-" in text and ssn_search(text):
-                violations.append(
-                    f"{source_name}[{record_id}].{raw_key}: SSN-like pattern detected"
-                )
-            if tlen >= 12 and phone_search(text):
-                violations.append(
-                    f"{source_name}[{record_id}].{raw_key}: telephone number pattern detected"
-                )
-            if "@" in text:
-                for match in email_finditer(text):
-                    domain = match.group(1).lower()
-                    if not (domain.endswith(".example") or domain in reserved_domains):
-                        violations.append(
-                            f"{source_name}[{record_id}].{raw_key}: non-reserved email domain '{domain}' detected"
-                        )
+    @classmethod
+    def scan_record(cls, source_name: str, record_id: str, payload: dict[str, Any]) -> list[str]:
+        """Return list of human-readable compliance violation messages (empty if clean)."""
+        violations: list[str] = []
+        cls._scan_dict_recursive(source_name, record_id, payload, "", violations)
         return violations
 
 

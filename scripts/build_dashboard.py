@@ -304,11 +304,13 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       --bg-surface: #FFFFFF;
       --bg-subtle: #F5F5F4;
       --border-color: #E7E5E4;
+      --control-border: #76736E;
       --text-primary: #1C1917;
       --text-secondary: #787774;
       --text-muted-aa: #57534E;
       --grid-line: #E7E5E4;
       --focus-ring: #0F766E;
+      --tab-active-border: #0F766E;
 
       --viz-teal: #0D9488;
       --viz-amber: #D97706;
@@ -341,11 +343,13 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       --bg-surface: #16171D;
       --bg-subtle: #1E2028;
       --border-color: #292A30;
+      --control-border: #6E707A;
       --text-primary: #ECE8E2;
       --text-secondary: #9A9895;
       --text-muted-aa: #B5B2AC;
       --grid-line: #292A30;
       --focus-ring: #5EEAD4;
+      --tab-active-border: #5EEAD4;
 
       --btn-primary-bg: #0F766E;
       --btn-primary-hover: #115E59;
@@ -481,12 +485,22 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     textarea {
       background-color: var(--bg-page);
       color: var(--text-primary);
-      border: 1px solid var(--border-color);
+      border: 1px solid var(--control-border);
       border-radius: 6px;
       padding: 6px 10px;
       font-family: inherit;
       font-size: 13px;
       transition: border-color 0.15s ease;
+    }
+
+    input::placeholder,
+    textarea::placeholder {
+      color: var(--text-muted-aa);
+      opacity: 1;
+    }
+
+    input[type="checkbox"] {
+      accent-color: var(--focus-ring);
     }
 
     select:focus,
@@ -498,7 +512,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     button {
       background-color: var(--bg-surface);
       color: var(--text-primary);
-      border: 1px solid var(--border-color);
+      border: 1px solid var(--control-border);
       border-radius: 6px;
       padding: 6px 12px;
       font-family: inherit;
@@ -526,7 +540,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     /* Three-Icon Theme Selector (DESIGN.md Section 3) */
     .theme-segmented {
       display: inline-flex;
-      border: 1px solid var(--border-color);
+      border: 1px solid var(--control-border);
       border-radius: 6px;
       overflow: hidden;
       background-color: var(--bg-page);
@@ -534,7 +548,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 
     .theme-segmented button {
       border: none;
-      border-right: 1px solid var(--border-color);
+      border-right: 1px solid var(--control-border);
       border-radius: 0;
       padding: 6px 9px;
       background: transparent;
@@ -592,7 +606,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 
     .view-tab.active {
       color: var(--text-primary);
-      border-bottom-color: var(--btn-primary-bg);
+      border-bottom-color: var(--tab-active-border);
       font-weight: 600;
     }
 
@@ -815,7 +829,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       font-family: "IBM Plex Mono", monospace;
       font-size: 11px;
       border-radius: 6px;
-      border: 1px solid var(--border-color);
+      border: 1px solid var(--control-border);
       background-color: var(--bg-page);
       color: var(--text-muted-aa);
     }
@@ -1141,13 +1155,13 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 
         <div class="pane col-7">
           <div class="subtab-bar" role="tablist" aria-label="Single-Site Record Categories">
-            <button class="subtab-btn active" data-site-subtab="signals" type="button" role="tab" aria-selected="true">Signals</button>
-            <button class="subtab-btn" data-site-subtab="events" type="button" role="tab" aria-selected="false">Safety &amp; EDC Events</button>
-            <button class="subtab-btn" data-site-subtab="issues" type="button" role="tab" aria-selected="false">QMS Issues &amp; Training</button>
-            <button class="subtab-btn" data-site-subtab="pds" type="button" role="tab" aria-selected="false">Protocol Deviations</button>
-            <button class="subtab-btn" data-site-subtab="candidates" type="button" role="tab" aria-selected="false">Matched Candidates</button>
+            <button id="site-subtab-signals" class="subtab-btn active" data-site-subtab="signals" type="button" role="tab" aria-selected="true" aria-controls="site-subtab-container">Signals</button>
+            <button id="site-subtab-events" class="subtab-btn" data-site-subtab="events" type="button" role="tab" aria-selected="false" aria-controls="site-subtab-container">Safety &amp; EDC Events</button>
+            <button id="site-subtab-issues" class="subtab-btn" data-site-subtab="issues" type="button" role="tab" aria-selected="false" aria-controls="site-subtab-container">QMS Issues &amp; Training</button>
+            <button id="site-subtab-pds" class="subtab-btn" data-site-subtab="pds" type="button" role="tab" aria-selected="false" aria-controls="site-subtab-container">Protocol Deviations</button>
+            <button id="site-subtab-candidates" class="subtab-btn" data-site-subtab="candidates" type="button" role="tab" aria-selected="false" aria-controls="site-subtab-container">Matched Candidates</button>
           </div>
-          <div id="site-subtab-container" class="table-wrap" role="tabpanel"></div>
+          <div id="site-subtab-container" class="table-wrap" role="tabpanel" aria-labelledby="site-subtab-signals"></div>
         </div>
 
         <div class="pane col-5">
@@ -1240,9 +1254,9 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
           </div>
           <div class="viz-toolbar">
             <div class="viz-btn-group" role="group" aria-label="3D Camera Presets">
-              <button type="button" class="viz-chip active" data-cam3d="iso">Isometric</button>
-              <button type="button" class="viz-chip" data-cam3d="xy">Biomarker / eGFR</button>
-              <button type="button" class="viz-chip" data-cam3d="top">Top Cohort</button>
+              <button type="button" class="viz-chip active" data-cam3d="iso" aria-pressed="true">Isometric</button>
+              <button type="button" class="viz-chip" data-cam3d="xy" aria-pressed="false">Biomarker / eGFR</button>
+              <button type="button" class="viz-chip" data-cam3d="top" aria-pressed="false">Top Cohort</button>
               <button type="button" id="btn-3d-orbit" class="viz-chip" aria-pressed="false">Auto-Orbit</button>
             </div>
             <div class="viz-btn-group">
@@ -1298,7 +1312,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
             </div>
           </div>
           <div class="table-wrap">
-            <table>
+            <table id="patient-selection-table" role="grid" aria-label="Synthetic Candidate Patient Pool">
               <thead>
                 <tr>
                   <th scope="col">Patient ID</th>
@@ -1415,12 +1429,13 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       <span>Synthetic De-Identified Reference Workbench (Non-GxP) | Zero External Tracking</span>
     </div>
     <div class="footer-links">
-      <a href="/privacy">Privacy</a>
-      <a href="/terms">Terms</a>
-      <a href="/refunds">Refunds</a>
-      <a href="/cookies">Cookies &amp; Storage</a>
+      <a href="/privacy" data-legal-file="privacy.md">Privacy</a>
+      <a href="/terms" data-legal-file="terms.md">Terms</a>
+      <a href="/refunds" data-legal-file="refunds.md">Refunds</a>
+      <a href="/cookies" data-legal-file="cookies.md">Cookies &amp; Storage</a>
       <button id="btn-export-local-data" type="button">Export Local Data</button>
       <button id="btn-clear-local-data" type="button">Clear Local Data</button>
+      <span id="footer-status" class="pane-meta mono" role="status" aria-live="polite"></span>
     </div>
   </footer>
 
@@ -3730,7 +3745,9 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 
     function syncCamPresetButtons(activeKey) {
       document.querySelectorAll("[data-cam3d]").forEach(function (b) {
-        b.classList.toggle("active", b.getAttribute("data-cam3d") === activeKey);
+        const isActive = b.getAttribute("data-cam3d") === activeKey;
+        b.classList.toggle("active", isActive);
+        b.setAttribute("aria-pressed", isActive ? "true" : "false");
       });
     }
 
@@ -3997,6 +4014,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         b.classList.toggle("active", isAct);
         b.setAttribute("aria-selected", isAct ? "true" : "false");
       });
+      if (btn.id) siteSubtabContainerEl.setAttribute("aria-labelledby", btn.id);
       renderSingleSite();
     }
     siteSubtabs.forEach(function (btn, idx) {
@@ -4072,6 +4090,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     });
 
     /* --- LOCAL BROWSER DATA PORTABILITY & ERASURE CONTROLS --- */
+    const footerStatusEl = document.getElementById("footer-status");
     document.getElementById("btn-export-local-data").addEventListener("click", function () {
       const payload = {
         exported_at: new Date().toISOString(),
@@ -4087,6 +4106,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
+      if (footerStatusEl) footerStatusEl.textContent = "[EXPORTED] workbench-local-data.json";
     });
 
     document.getElementById("btn-clear-local-data").addEventListener("click", function () {
@@ -4101,7 +4121,14 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       invalidateNodeLayoutCache();
       applyThemeMode("system");
       renderActiveView();
+      if (footerStatusEl) footerStatusEl.textContent = "[CLEARED] Local storage preferences and feedback removed";
     });
+
+    if (window.location.protocol === "file:") {
+      document.querySelectorAll(".footer-links a[data-legal-file]").forEach(function (link) {
+        link.setAttribute("href", "legal/" + link.getAttribute("data-legal-file"));
+      });
+    }
 
     window.addEventListener("resize", scheduleResizeRedraw);
 
@@ -4162,11 +4189,13 @@ def serialize_bundle_json(bundle: dict[str, Any]) -> str:
 
 
 def _escape_inline_json(raw_json: str) -> str:
-    """Escape closing script tags and HTML comment markers safely for inline script embedding."""
-    escaped = raw_json.replace("</", "<\\/")
-    if "<!--" in escaped:
-        escaped = escaped.replace("<!--", "<\\!--")
-    return escaped
+    """Escape HTML-significant angle brackets and JS line separators as valid RFC 8259 JSON."""
+    return (
+        raw_json.replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
 
 
 def _atomic_write_chunks(path: Path, chunks: tuple[str, ...]) -> int:

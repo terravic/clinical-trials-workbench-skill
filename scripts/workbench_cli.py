@@ -118,6 +118,8 @@ def _render_legal_html(title: str, markdown_body: str) -> bytes:
         "  <style>\n"
         "    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; "
         "background: #FAFAF9; color: #1C1917; max-width: 860px; margin: 0 auto; padding: 24px; line-height: 1.6; }\n"
+        "    .skip-link { position: absolute; left: -9999px; top: 0; background: #0F766E; color: #FFFFFF; padding: 8px 14px; font-weight: 600; text-decoration: none; border-radius: 0 0 6px 0; }\n"
+        "    .skip-link:focus { left: 0; outline: 2px solid #0F766E; outline-offset: 2px; }\n"
         "    header { border-bottom: 1px solid #E7E5E4; padding-bottom: 12px; margin-bottom: 20px; }\n"
         "    a { color: #0F766E; }\n"
         "    a:focus-visible { outline: 2px solid #0F766E; outline-offset: 2px; }\n"
@@ -127,6 +129,7 @@ def _render_legal_html(title: str, markdown_body: str) -> bytes:
         "  </style>\n"
         "</head>\n"
         "<body>\n"
+        '  <a class="skip-link" href="#legal-main">Skip to main content</a>\n'
         "  <header>\n"
         f"    <h1>{escaped_title}</h1>\n"
         '    <nav aria-label="Legal Navigation">'
@@ -137,7 +140,7 @@ def _render_legal_html(title: str, markdown_body: str) -> bytes:
         '<a href="/cookies">Cookies</a>'
         "</nav>\n"
         "  </header>\n"
-        "  <main>\n"
+        '  <main id="legal-main" tabindex="-1">\n'
         f"    <pre>{escaped_body}</pre>\n"
         "  </main>\n"
         "  <footer>DRAFT — REQUIRES LEGAL REVIEW</footer>\n"
@@ -460,24 +463,39 @@ def create_workbench_http_server(
         def _validate_host_and_origin(self) -> bool:
             raw_host = (self.headers.get("Host") or "").strip()
             if raw_host:
+                if any(ch.isspace() or ord(ch) < 32 for ch in raw_host):
+                    self._send_json(HTTPStatus.FORBIDDEN, {"error": "Invalid Host header"})
+                    return False
                 if raw_host.startswith("["):
-                    host_only = raw_host.split("]")[0].lstrip("[").lower()
+                    if "]" not in raw_host:
+                        self._send_json(HTTPStatus.FORBIDDEN, {"error": "Invalid Host header"})
+                        return False
+                    host_only = raw_host.split("]", 1)[0].lstrip("[").lower()
                 else:
-                    host_only = raw_host.split(":")[0].lower()
+                    host_only = raw_host.split(":", 1)[0].lower()
                 if host_only not in allowed_hosts:
                     self._send_json(HTTPStatus.FORBIDDEN, {"error": "Invalid Host header"})
                     return False
 
             raw_origin = (self.headers.get("Origin") or "").strip()
             if raw_origin:
-                parsed_origin = urlsplit(raw_origin)
-                origin_host = (parsed_origin.hostname or "").lower()
+                try:
+                    parsed_origin = urlsplit(raw_origin)
+                    origin_host = (parsed_origin.hostname or "").lower()
+                    origin_port = parsed_origin.port
+                except ValueError:
+                    self._send_json(HTTPStatus.FORBIDDEN, {"error": "Cross-origin request rejected"})
+                    return False
                 bound_port = self.server.server_address[1]
-                origin_port = parsed_origin.port
+                effective_origin_port = (
+                    origin_port
+                    if origin_port is not None
+                    else (443 if parsed_origin.scheme == "https" else 80)
+                )
                 if (
                     parsed_origin.scheme not in ("http", "https")
                     or origin_host not in allowed_hosts
-                    or (origin_port is not None and origin_port != bound_port)
+                    or effective_origin_port != bound_port
                 ):
                     self._send_json(HTTPStatus.FORBIDDEN, {"error": "Cross-origin request rejected"})
                     return False
@@ -508,11 +526,11 @@ def create_workbench_http_server(
         def _authorize_reviewer_owner(self, target_reviewer_id: str) -> bool:
             if not self._check_bearer_auth(mandatory=True):
                 return False
-            owner = effective_reviewer or (self.headers.get("X-Authenticated-Reviewer") or "").strip()
+            owner = (effective_reviewer or "").strip()
             if not owner:
                 self._send_json(
                     HTTPStatus.FORBIDDEN,
-                    {"error": "Authenticated reviewer identity required"},
+                    {"error": "Server reviewer identity (CTW_AUTHENTICATED_REVIEWER) required"},
                 )
                 return False
             if not hmac.compare_digest(owner, target_reviewer_id):
@@ -539,7 +557,11 @@ def create_workbench_http_server(
                     {"error": f"Request body exceeds {MAX_REQUEST_BODY_BYTES} byte limit"},
                 )
                 return None
-            raw_body = self.rfile.read(length).decode("utf-8", errors="strict") if length > 0 else "{}"
+            try:
+                raw_body = self.rfile.read(length).decode("utf-8", errors="strict") if length > 0 else "{}"
+            except UnicodeDecodeError:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Request body must be valid UTF-8"})
+                return None
             try:
                 parsed = json.loads(raw_body)
             except json.JSONDecodeError:
@@ -550,6 +572,34 @@ def create_workbench_http_server(
                 return None
             return parsed
 
+        def _handle_method_not_allowed(self) -> None:
+            if not self._validate_host_and_origin():
+                return
+            body = json.dumps({"error": "Method not allowed"}, separators=(",", ":")).encode("utf-8")
+            self.send_response(HTTPStatus.METHOD_NOT_ALLOWED)
+            self._send_security_headers()
+            self.send_header("Allow", "GET, POST")
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+
+        def do_PUT(self) -> None:  # noqa: N802
+            self._handle_method_not_allowed()
+
+        def do_DELETE(self) -> None:  # noqa: N802
+            self._handle_method_not_allowed()
+
+        def do_PATCH(self) -> None:  # noqa: N802
+            self._handle_method_not_allowed()
+
+        def do_OPTIONS(self) -> None:  # noqa: N802
+            self._handle_method_not_allowed()
+
         def do_GET(self) -> None:  # noqa: N802
             if not self._validate_host_and_origin():
                 return
@@ -558,15 +608,19 @@ def create_workbench_http_server(
             query = parse_qs(parsed.query)
 
             if route in ("/", "/dashboard.html"):
-                st = dashboard_path.stat()
-                sig = (st.st_mtime_ns, st.st_size)
-                with cache_lock:
-                    if dash_cache["sig"] == sig:
-                        html_bytes = dash_cache["bytes"]
-                    else:
-                        html_bytes = dashboard_path.read_bytes()
-                        dash_cache["sig"] = sig
-                        dash_cache["bytes"] = html_bytes
+                try:
+                    st = dashboard_path.stat()
+                    sig = (st.st_mtime_ns, st.st_size)
+                    with cache_lock:
+                        if dash_cache["sig"] == sig:
+                            html_bytes = dash_cache["bytes"]
+                        else:
+                            html_bytes = dashboard_path.read_bytes()
+                            dash_cache["sig"] = sig
+                            dash_cache["bytes"] = html_bytes
+                except FileNotFoundError:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": "Dashboard artifact not found"})
+                    return
                 self.send_response(HTTPStatus.OK)
                 self._send_security_headers()
                 self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -582,12 +636,14 @@ def create_workbench_http_server(
             if route.startswith("/assets/fonts/"):
                 font_name = route[len("/assets/fonts/"):]
                 if font_name in ALLOWED_FONT_FILES:
-                    font_bytes = font_cache.get(font_name)
+                    with cache_lock:
+                        font_bytes = font_cache.get(font_name)
                     if font_bytes is None:
                         font_path = DEFAULT_FONTS_DIR / font_name
                         if font_path.is_file():
                             font_bytes = font_path.read_bytes()
-                            font_cache[font_name] = font_bytes
+                            with cache_lock:
+                                font_cache[font_name] = font_bytes
                     if font_bytes is not None:
                         self.send_response(HTTPStatus.OK)
                         self._send_security_headers()
@@ -608,12 +664,14 @@ def create_workbench_http_server(
                 legal_path = DEFAULT_LEGAL_DIR / filename
                 if legal_path.is_file():
                     st_l = legal_path.stat()
-                    cached_l = legal_cache.get(route)
+                    with cache_lock:
+                        cached_l = legal_cache.get(route)
                     if cached_l is not None and cached_l[0] == st_l.st_mtime_ns and cached_l[1] == st_l.st_size:
                         body = cached_l[2]
                     else:
                         body = _render_legal_html(title, legal_path.read_text(encoding="utf-8"))
-                        legal_cache[route] = (st_l.st_mtime_ns, st_l.st_size, body)
+                        with cache_lock:
+                            legal_cache[route] = (st_l.st_mtime_ns, st_l.st_size, body)
                     self.send_response(HTTPStatus.OK)
                     self._send_security_headers()
                     self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -633,6 +691,8 @@ def create_workbench_http_server(
                 return
 
             if route == "/api/user-data/export":
+                if not self._check_bearer_auth(mandatory=True):
+                    return
                 req_reviewer = (query.get("reviewer_id") or [""])[0].strip()
                 if not req_reviewer:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Missing reviewer_id query parameter"})
@@ -741,7 +801,16 @@ def create_workbench_http_server(
                             {"error": f"Field '{field_name}' must be a string"},
                         )
                         return
-                target_reviewer = req.get("reviewer_id", "CRA-01")
+                if "reviewer_id" in req:
+                    target_reviewer = req["reviewer_id"].strip()
+                    if not target_reviewer:
+                        self._send_json(
+                            HTTPStatus.BAD_REQUEST,
+                            {"error": "Field 'reviewer_id' must not be empty"},
+                        )
+                        return
+                else:
+                    target_reviewer = effective_reviewer or "CRA-01"
                 if effective_reviewer and not hmac.compare_digest(effective_reviewer, target_reviewer):
                     self._send_json(
                         HTTPStatus.FORBIDDEN,
@@ -765,6 +834,8 @@ def create_workbench_http_server(
                 return
 
             if route == "/api/user-data/delete":
+                if not self._check_bearer_auth(mandatory=True):
+                    return
                 req = self._read_json_body()
                 if req is None:
                     return
@@ -780,6 +851,12 @@ def create_workbench_http_server(
                     )
                     return
                 target_reviewer = req["reviewer_id"].strip()
+                if not target_reviewer:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {"error": "Field 'reviewer_id' must not be empty"},
+                    )
+                    return
                 if not self._authorize_reviewer_owner(target_reviewer):
                     return
                 try:

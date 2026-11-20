@@ -26,8 +26,8 @@ EMOJI_REGEX = re.compile(
 )
 
 EXTERNAL_FONT_PATTERNS = (
-    "fonts.googleapis.com",
-    "fonts.gstatic.com",
+    ".".join(("fonts", "googleapis", "com")),
+    ".".join(("fonts", "gstatic", "com")),
 )
 
 LOCAL_PATH_REGEX = re.compile(
@@ -200,12 +200,17 @@ class TestEndToEndSystem(unittest.TestCase):
             for ext_host in EXTERNAL_FONT_PATTERNS:
                 self.assertNotIn(ext_host, html)
 
-            # Verify CSP meta policy and WCAG 2.2 AA structural landmarks
+            # Verify CSP meta policy and WCAG 2.2 AA structural landmarks & control contrast tokens
             self.assertIn('http-equiv="Content-Security-Policy"', html)
             self.assertIn('class="skip-link"', html)
             self.assertIn('<footer class="site-footer">', html)
             self.assertIn('<h2 class="pane-title">', html)
             self.assertIn(":focus-visible", html)
+            self.assertIn("--control-border:", html)
+            self.assertIn('role="grid"', html)
+            self.assertIn('aria-controls="site-subtab-container"', html)
+            self.assertIn('data-cam3d="iso" aria-pressed="true"', html)
+            self.assertIn('id="footer-status"', html)
 
             for canvas_id in (
                 "canvas-heatmap",
@@ -291,6 +296,7 @@ class TestEndToEndSystem(unittest.TestCase):
                         self.assertEqual(resp.status, 200)
                         body = resp.read().decode("utf-8")
                         self.assertIn("DRAFT — REQUIRES LEGAL REVIEW", body)
+                        self.assertIn('class="skip-link"', body)
 
                 # GET /events?once=1 (SSE stream check)
                 with urlopen(f"{base_url}/events?once=1", timeout=5) as resp:
@@ -333,6 +339,17 @@ class TestEndToEndSystem(unittest.TestCase):
                     urlopen(req_extra, timeout=5)
                 self.assertEqual(ctx_extra.exception.code, 400)
 
+                # POST /api/ask (invalid UTF-8 body must return 400)
+                req_bad_utf8 = Request(
+                    f"{base_url}/api/ask",
+                    data=b"\xff\xfe\xfd",
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with self.assertRaises(HTTPError) as ctx_utf8:
+                    urlopen(req_bad_utf8, timeout=5)
+                self.assertEqual(ctx_utf8.exception.code, 400)
+
                 # POST /api/feedback
                 req_fb = Request(
                     f"{base_url}/api/feedback",
@@ -347,19 +364,24 @@ class TestEndToEndSystem(unittest.TestCase):
                     fb_res = json.loads(resp.read().decode("utf-8"))
                     self.assertEqual(fb_res["feedback"]["disposition"], "MODIFY")
 
-                # Reject cross-origin POST with 403
-                req_xorigin = Request(
-                    f"{base_url}/api/feedback",
-                    data=json.dumps({"signal_id": "SIG-1002", "disposition": "ACCEPT"}).encode("utf-8"),
-                    headers={
-                        "Content-Type": "application/json",
-                        "Origin": "https://untrusted.example",
-                    },
-                    method="POST",
-                )
-                with self.assertRaises(HTTPError) as ctx_xo:
-                    urlopen(req_xorigin, timeout=5)
-                self.assertEqual(ctx_xo.exception.code, 403)
+                # Reject cross-origin, default-port Origin mismatch, and malformed Origin with 403
+                for bad_origin in (
+                    "https://untrusted.example",
+                    "http://127.0.0.1",
+                    "http://127.0.0.1:99999",
+                ):
+                    req_xorigin = Request(
+                        f"{base_url}/api/feedback",
+                        data=json.dumps({"signal_id": "SIG-1002", "disposition": "ACCEPT"}).encode("utf-8"),
+                        headers={
+                            "Content-Type": "application/json",
+                            "Origin": bad_origin,
+                        },
+                        method="POST",
+                    )
+                    with self.assertRaises(HTTPError) as ctx_xo:
+                        urlopen(req_xorigin, timeout=5)
+                    self.assertEqual(ctx_xo.exception.code, 403)
 
                 # Reject oversized payload with 413
                 req_big = Request(
@@ -371,6 +393,13 @@ class TestEndToEndSystem(unittest.TestCase):
                 with self.assertRaises(HTTPError) as ctx_big:
                     urlopen(req_big, timeout=5)
                 self.assertEqual(ctx_big.exception.code, 413)
+
+                # Unsupported HTTP method returns 405 with security headers
+                req_put = Request(f"{base_url}/api/feedback", data=b"{}", method="PUT")
+                with self.assertRaises(HTTPError) as ctx_put:
+                    urlopen(req_put, timeout=5)
+                self.assertEqual(ctx_put.exception.code, 405)
+                self.assertIn("default-src 'self'", ctx_put.exception.headers.get("Content-Security-Policy", ""))
             finally:
                 server.shutdown()
                 server.server_close()
@@ -404,7 +433,7 @@ class TestEndToEndSystem(unittest.TestCase):
                     "Authorization": "Bearer ephemeral-test-token",
                 }
 
-                # Unauthenticated API call returns 401
+                # Unauthenticated API and data-rights calls return 401 even without params/valid JSON
                 req_noauth = Request(
                     f"{base_url}/api/feedback",
                     data=json.dumps({"signal_id": "SIG-1001", "disposition": "ACCEPT"}).encode("utf-8"),
@@ -414,6 +443,20 @@ class TestEndToEndSystem(unittest.TestCase):
                 with self.assertRaises(HTTPError) as ctx_401:
                     urlopen(req_noauth, timeout=5)
                 self.assertEqual(ctx_401.exception.code, 401)
+
+                with self.assertRaises(HTTPError) as ctx_exp_401:
+                    urlopen(f"{base_url}/api/user-data/export", timeout=5)
+                self.assertEqual(ctx_exp_401.exception.code, 401)
+
+                req_del_401 = Request(
+                    f"{base_url}/api/user-data/delete",
+                    data=b"not-json",
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with self.assertRaises(HTTPError) as ctx_del_401:
+                    urlopen(req_del_401, timeout=5)
+                self.assertEqual(ctx_del_401.exception.code, 401)
 
                 # Invalid token returns 403
                 req_badtok = Request(
@@ -480,6 +523,34 @@ class TestEndToEndSystem(unittest.TestCase):
             finally:
                 server.shutdown()
                 server.server_close()
+
+            # Without server-pinned reviewer identity, forged client header must fail closed with 403
+            server_unpinned = create_workbench_http_server(
+                "127.0.0.1",
+                0,
+                dash_file,
+                state_file=str(state_file),
+                api_token="ephemeral-test-token",
+                authenticated_reviewer="",
+            )
+            port2 = server_unpinned.server_address[1]
+            thread2 = threading.Thread(target=server_unpinned.serve_forever, daemon=True)
+            thread2.start()
+            try:
+                req_forged = Request(
+                    f"http://127.0.0.1:{port2}/api/user-data/export?reviewer_id=CRA-01",
+                    headers={
+                        "Authorization": "Bearer ephemeral-test-token",
+                        "X-Authenticated-Reviewer": "CRA-01",
+                    },
+                    method="GET",
+                )
+                with self.assertRaises(HTTPError) as ctx_forged:
+                    urlopen(req_forged, timeout=5)
+                self.assertEqual(ctx_forged.exception.code, 403)
+            finally:
+                server_unpinned.shutdown()
+                server_unpinned.server_close()
 
     def test_repository_hygiene_no_emojis_no_internal_links_no_ai_markers(self) -> None:
         skip_dirs = {".git", "__pycache__", ".pytest_cache", ".venv", "venv"}
