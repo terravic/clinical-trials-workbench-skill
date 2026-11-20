@@ -232,6 +232,23 @@ def build_portfolio_executive_briefing(
     }
 
 
+_TEMPLATE_CACHE: dict[tuple[str, int, int], str] = {}
+
+
+def _read_template_cached(path: Path) -> str:
+    resolved = path.resolve()
+    st = resolved.stat()
+    key = (str(resolved), st.st_mtime_ns, st.st_size)
+    cached = _TEMPLATE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    text = resolved.read_text(encoding="utf-8")
+    if len(_TEMPLATE_CACHE) > 32:
+        _TEMPLATE_CACHE.clear()
+    _TEMPLATE_CACHE[key] = text
+    return text
+
+
 def draft_monitoring_visit_agenda(
     site_id: str,
     signal_bundle: dict[str, Any],
@@ -288,7 +305,7 @@ def draft_monitoring_visit_agenda(
         cand_block = "- Zero pending candidates routed to this site (check site enrollment pause or cold-chain status)."
 
     tpl_path = (templates_dir or DEFAULT_TEMPLATES_DIR) / "monitoring_visit_agenda.md.tpl"
-    tpl = tpl_path.read_text(encoding="utf-8")
+    tpl = _read_template_cached(tpl_path)
     return tpl.format(
         site_id=site["site_id"],
         site_name=site["site_name"],
@@ -347,7 +364,7 @@ def draft_site_followup_email(
         items_text = "   [1] Routine monthly monitoring check-in; no critical risk signals active."
 
     tpl_path = (templates_dir or DEFAULT_TEMPLATES_DIR) / "site_followup_email.txt.tpl"
-    tpl = tpl_path.read_text(encoding="utf-8")
+    tpl = _read_template_cached(tpl_path)
     return tpl.format(
         site_id_lower=site["site_id"].lower(),
         cra_id_lower=site["assigned_cra_id"].lower(),
@@ -380,7 +397,7 @@ def draft_issue_payload(
         raise EntityNotFoundError(f"Unknown signal_id '{signal_id}'")
 
     tpl_path = (templates_dir or DEFAULT_TEMPLATES_DIR) / "issue_capa_record.json.tpl"
-    raw_tpl = tpl_path.read_text(encoding="utf-8")
+    raw_tpl = _read_template_cached(tpl_path)
     # Perform safe JSON field population
     template_obj = json.loads(raw_tpl)
     template_obj["generated_date"] = signal_bundle["reference_date"]

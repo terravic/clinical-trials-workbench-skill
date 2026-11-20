@@ -34,6 +34,8 @@ from scripts import (
     SQLSafetyError,
     WorkbenchError,
     configure_logging,
+    resolve_data_dir,
+    resolve_state_file,
 )
 from scripts.action_drafter import (
     build_portfolio_executive_briefing,
@@ -46,11 +48,20 @@ from scripts.action_drafter import (
     record_signal_feedback,
 )
 from scripts.analytics_assistant import answer_analytics_question
-from scripts.build_dashboard import build_standalone_dashboard, compile_workspace_bundle
-from scripts.data_ingestor import ingest_workspace_data
+from scripts.build_dashboard import (
+    build_standalone_dashboard,
+    compile_workspace_bundle,
+    serialize_bundle_json,
+    write_dashboard_from_bundle,
+)
+from scripts.data_ingestor import REQUIRED_SOURCE_FILES, ingest_workspace_data
 from scripts.generate_synthetic_data import generate_all_synthetic_data
 from scripts.signal_engine import evaluate_signals_and_sites, get_signal_by_id
-from scripts.trial_selector import run_trial_selection
+from scripts.trial_selector import (
+    evaluate_selection_criteria_once,
+    filter_selection_evaluations,
+    finalize_selection_with_site_risks,
+)
 
 MAX_REQUEST_BODY_BYTES = 65_536
 MAX_SSE_SUBSCRIBERS = 32
@@ -151,19 +162,65 @@ def _validate_exact_keys(
     return None
 
 
+def _workspace_fingerprint(
+    data_dir: str | None, state_file: str | None
+) -> tuple[Any, ...]:
+    """Compute a fast stat-based fingerprint across all 10 data feeds and the HITL state file."""
+    resolved_data = resolve_data_dir(data_dir)
+    resolved_state = resolve_state_file(state_file)
+    sig: list[Any] = [str(resolved_data), str(resolved_state)]
+    for filename, _ in REQUIRED_SOURCE_FILES:
+        fpath = resolved_data / filename
+        try:
+            st = fpath.stat()
+            sig.append((st.st_mtime_ns, st.st_size))
+        except OSError:
+            sig.append(None)
+    try:
+        st_s = resolved_state.stat()
+        sig.append((st_s.st_mtime_ns, st_s.st_size))
+    except OSError:
+        sig.append(None)
+    return tuple(sig)
+
+
 def _prepare_runtime_context(
-    data_dir: str | None, state_file: str | None, strict: bool
+    data_dir: str | None,
+    state_file: str | None,
+    strict: bool,
+    *,
+    persist_tables: bool = True,
+    need_selection_pass2: bool = True,
+    include_site_rankings: bool = False,
+    check_same_thread: bool = True,
 ) -> tuple[Any, dict[str, Any], dict[str, Any]]:
-    """Ingest feeds, run selection & signal engines, and return (conn, signal_bundle, selection_bundle)."""
-    conn, _ = ingest_workspace_data(data_dir=data_dir, strict=strict)
-    feedback = load_feedback_state(state_file=state_file, strict=strict)
-    run_trial_selection(conn, persist_table=True)
-    signal_bundle = evaluate_signals_and_sites(conn, feedback_map=feedback)
-    risk_map = {s["site_id"]: s["risk_score"] for s in signal_bundle["sites"]}
-    selection_bundle = run_trial_selection(
-        conn, site_risk_scores=risk_map, persist_table=True
+    """Ingest feeds, run single-pass criteria + signals + live site ranking, and return context."""
+    conn, _ = ingest_workspace_data(
+        data_dir=data_dir, strict=strict, check_same_thread=check_same_thread
     )
-    return conn, signal_bundle, selection_bundle
+    try:
+        feedback = load_feedback_state(state_file=state_file, strict=strict)
+        precompute = evaluate_selection_criteria_once(conn)
+        signal_bundle = evaluate_signals_and_sites(
+            conn,
+            feedback_map=feedback,
+            local_elig_by_site=precompute.local_elig_by_site,
+            persist_tables=persist_tables,
+        )
+        if not need_selection_pass2:
+            return conn, signal_bundle, {}
+        risk_map = {s["site_id"]: s["risk_score"] for s in signal_bundle["sites"]}
+        selection_bundle = finalize_selection_with_site_risks(
+            conn,
+            precompute,
+            site_risk_scores=risk_map,
+            persist_table=persist_tables,
+            include_site_rankings=include_site_rankings,
+        )
+        return conn, signal_bundle, selection_bundle
+    except Exception:
+        conn.close()
+        raise
 
 
 def _format_portfolio_markdown(
@@ -254,6 +311,7 @@ def create_workbench_http_server(
     state_file: str | None = None,
     api_token: str | None = None,
     authenticated_reviewer: str | None = None,
+    initial_bundle_json: str | None = None,
 ) -> ThreadingHTTPServer:
     """Create a hardened, thread-safe local HTTP + Server-Sent Events (SSE) workbench server."""
     effective_token = api_token if api_token is not None else os.environ.get("CTW_API_TOKEN")
@@ -276,16 +334,100 @@ def create_workbench_http_server(
     subscribers: list[queue.Queue[str]] = []
     sub_lock = threading.Lock()
     state_lock = threading.Lock()
+    cache_lock = threading.Lock()
+    ask_lock = threading.Lock()
 
-    def broadcast_update() -> None:
+    state_version = 0
+    bundle_cache: dict[str, Any] = {"key": None, "json_bytes": None}
+    if initial_bundle_json is not None:
+        bundle_cache["key"] = (_workspace_fingerprint(data_dir, state_file), state_version)
+        bundle_cache["json_bytes"] = initial_bundle_json.encode("utf-8")
+
+    ask_conn_cache: dict[str, Any] = {"key": None, "conn": None}
+    font_cache: dict[str, bytes] = {}
+    legal_cache: dict[str, tuple[int, int, bytes]] = {}
+    dash_cache: dict[str, Any] = {"sig": None, "bytes": b""}
+
+    def _current_cache_key() -> tuple[Any, int]:
+        fp = _workspace_fingerprint(data_dir, state_file)
+        with cache_lock:
+            return (fp, state_version)
+
+    def get_bundle_json_bytes() -> bytes:
+        key = _current_cache_key()
+        with cache_lock:
+            if bundle_cache["key"] == key and bundle_cache["json_bytes"] is not None:
+                return bundle_cache["json_bytes"]
         bundle = compile_workspace_bundle(data_dir=data_dir, state_file=state_file)
-        payload = json.dumps(bundle, separators=(",", ":"))
-        with sub_lock:
-            for q in list(subscribers):
+        encoded = serialize_bundle_json(bundle).encode("utf-8")
+        with cache_lock:
+            if state_version == key[1]:
+                bundle_cache["key"] = key
+                bundle_cache["json_bytes"] = encoded
+        return encoded
+
+    def _invalidate_ask_conn() -> None:
+        with ask_lock:
+            old_conn = ask_conn_cache["conn"]
+            ask_conn_cache["conn"] = None
+            ask_conn_cache["key"] = None
+            if old_conn is not None:
                 try:
-                    q.put_nowait(payload)
-                except queue.Full:
+                    old_conn.close()
+                except Exception:
                     pass
+
+    def execute_cached_ask(question: str | None, custom_sql: str | None) -> dict[str, Any]:
+        key = _current_cache_key()
+        with ask_lock:
+            conn = ask_conn_cache["conn"]
+            if conn is None or ask_conn_cache["key"] != key:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                conn, _, _ = _prepare_runtime_context(
+                    data_dir,
+                    state_file,
+                    strict=False,
+                    persist_tables=True,
+                    need_selection_pass2=True,
+                    include_site_rankings=False,
+                    check_same_thread=False,
+                )
+                ask_conn_cache["conn"] = conn
+                ask_conn_cache["key"] = key
+            return answer_analytics_question(
+                conn,
+                question=question,
+                custom_sql=custom_sql,
+            )
+
+    def broadcast_payload(payload: str) -> None:
+        with sub_lock:
+            if not subscribers:
+                return
+            targets = list(subscribers)
+        for q in targets:
+            try:
+                q.put_nowait(payload)
+            except queue.Full:
+                pass
+
+    def _refresh_after_state_mutation() -> str:
+        """Rebuild bundle and dashboard.html once, refresh caches, and return serialized JSON."""
+        nonlocal state_version
+        bundle = compile_workspace_bundle(data_dir=data_dir, state_file=state_file)
+        _, raw_json = write_dashboard_from_bundle(dashboard_path, bundle)
+        new_fp = _workspace_fingerprint(data_dir, state_file)
+        encoded = raw_json.encode("utf-8")
+        with cache_lock:
+            state_version += 1
+            bundle_cache["key"] = (new_fp, state_version)
+            bundle_cache["json_bytes"] = encoded
+        _invalidate_ask_conn()
+        return raw_json
 
     class WorkbenchRequestHandler(BaseHTTPRequestHandler):
         def log_message(self, fmt: str, *args: Any) -> None:
@@ -300,8 +442,7 @@ def create_workbench_http_server(
             self.send_header("Cross-Origin-Resource-Policy", "same-origin")
             self.send_header("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
 
-        def _send_json(self, status: int, data: dict[str, Any]) -> None:
-            body = json.dumps(data).encode("utf-8")
+        def _send_json_bytes(self, status: int, body: bytes) -> None:
             self.send_response(status)
             self._send_security_headers()
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -312,6 +453,9 @@ def create_workbench_http_server(
                 self.wfile.write(body)
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
+
+        def _send_json(self, status: int, data: dict[str, Any]) -> None:
+            self._send_json_bytes(status, json.dumps(data, separators=(",", ":")).encode("utf-8"))
 
         def _validate_host_and_origin(self) -> bool:
             raw_host = (self.headers.get("Host") or "").strip()
@@ -414,7 +558,15 @@ def create_workbench_http_server(
             query = parse_qs(parsed.query)
 
             if route in ("/", "/dashboard.html"):
-                html_bytes = dashboard_path.read_bytes()
+                st = dashboard_path.stat()
+                sig = (st.st_mtime_ns, st.st_size)
+                with cache_lock:
+                    if dash_cache["sig"] == sig:
+                        html_bytes = dash_cache["bytes"]
+                    else:
+                        html_bytes = dashboard_path.read_bytes()
+                        dash_cache["sig"] = sig
+                        dash_cache["bytes"] = html_bytes
                 self.send_response(HTTPStatus.OK)
                 self._send_security_headers()
                 self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -430,9 +582,13 @@ def create_workbench_http_server(
             if route.startswith("/assets/fonts/"):
                 font_name = route[len("/assets/fonts/"):]
                 if font_name in ALLOWED_FONT_FILES:
-                    font_path = DEFAULT_FONTS_DIR / font_name
-                    if font_path.is_file():
-                        font_bytes = font_path.read_bytes()
+                    font_bytes = font_cache.get(font_name)
+                    if font_bytes is None:
+                        font_path = DEFAULT_FONTS_DIR / font_name
+                        if font_path.is_file():
+                            font_bytes = font_path.read_bytes()
+                            font_cache[font_name] = font_bytes
+                    if font_bytes is not None:
                         self.send_response(HTTPStatus.OK)
                         self._send_security_headers()
                         self.send_header("Content-Type", "font/woff2")
@@ -451,7 +607,13 @@ def create_workbench_http_server(
                 title, filename = LEGAL_ROUTE_FILES[route]
                 legal_path = DEFAULT_LEGAL_DIR / filename
                 if legal_path.is_file():
-                    body = _render_legal_html(title, legal_path.read_text(encoding="utf-8"))
+                    st_l = legal_path.stat()
+                    cached_l = legal_cache.get(route)
+                    if cached_l is not None and cached_l[0] == st_l.st_mtime_ns and cached_l[1] == st_l.st_size:
+                        body = cached_l[2]
+                    else:
+                        body = _render_legal_html(title, legal_path.read_text(encoding="utf-8"))
+                        legal_cache[route] = (st_l.st_mtime_ns, st_l.st_size, body)
                     self.send_response(HTTPStatus.OK)
                     self._send_security_headers()
                     self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -467,8 +629,7 @@ def create_workbench_http_server(
             if route == "/api/bundle":
                 if not self._check_bearer_auth(mandatory=False):
                     return
-                bundle = compile_workspace_bundle(data_dir=data_dir, state_file=state_file)
-                self._send_json(HTTPStatus.OK, bundle)
+                self._send_json_bytes(HTTPStatus.OK, get_bundle_json_bytes())
                 return
 
             if route == "/api/user-data/export":
@@ -552,18 +713,11 @@ def create_workbench_http_server(
                 if custom_sql is not None and (not isinstance(custom_sql, str) or len(custom_sql) > MAX_SQL_PAYLOAD_LENGTH):
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Invalid 'sql' field"})
                     return
-                conn, _, _ = _prepare_runtime_context(data_dir, state_file, strict=False)
                 try:
-                    ans = answer_analytics_question(
-                        conn,
-                        question=question,
-                        custom_sql=custom_sql,
-                    )
+                    ans = execute_cached_ask(question=question, custom_sql=custom_sql)
                     self._send_json(HTTPStatus.OK, ans)
                 except (SQLSafetyError, ValueError) as exc:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                finally:
-                    conn.close()
                 return
 
             if route == "/api/feedback":
@@ -603,12 +757,8 @@ def create_workbench_http_server(
                             reviewer_id=target_reviewer,
                             state_file=state_file,
                         )
-                        build_standalone_dashboard(
-                            output_path=dashboard_path,
-                            data_dir=data_dir,
-                            state_file=state_file,
-                        )
-                    broadcast_update()
+                        raw_json = _refresh_after_state_mutation()
+                    broadcast_payload(raw_json)
                     self._send_json(HTTPStatus.OK, {"status": "saved", "feedback": entry})
                 except (KeyError, ValueError) as exc:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
@@ -635,12 +785,8 @@ def create_workbench_http_server(
                 try:
                     with state_lock:
                         deletion = delete_reviewer_data(target_reviewer, state_file=state_file)
-                        build_standalone_dashboard(
-                            output_path=dashboard_path,
-                            data_dir=data_dir,
-                            state_file=state_file,
-                        )
-                    broadcast_update()
+                        raw_json = _refresh_after_state_mutation()
+                    broadcast_payload(raw_json)
                     self._send_json(HTTPStatus.OK, {"status": "deleted", **deletion})
                 except ValueError as exc:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
@@ -648,7 +794,12 @@ def create_workbench_http_server(
 
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "Endpoint not found"})
 
-    return ThreadingHTTPServer((host, port), WorkbenchRequestHandler)
+    class _WorkbenchHTTPServer(ThreadingHTTPServer):
+        def server_close(self) -> None:
+            _invalidate_ask_conn()
+            super().server_close()
+
+    return _WorkbenchHTTPServer((host, port), WorkbenchRequestHandler)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -763,11 +914,14 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "serve":
-            dash_info = build_standalone_dashboard(
-                output_path=args.output,
+            bundle = compile_workspace_bundle(
                 data_dir=args.data_dir,
                 state_file=args.state_file,
                 strict=args.strict,
+            )
+            dash_info, raw_json = write_dashboard_from_bundle(
+                output_path=args.output,
+                bundle=bundle,
             )
             dash_path = Path(dash_info["dashboard_path"])
             server = create_workbench_http_server(
@@ -776,6 +930,7 @@ def main(argv: list[str] | None = None) -> int:
                 dash_path,
                 data_dir=args.data_dir,
                 state_file=args.state_file,
+                initial_bundle_json=raw_json,
             )
             print(f"Serving Clinical Trials Workbench at http://{args.host}:{args.port} (SSE /events active)")
             try:
@@ -786,8 +941,20 @@ def main(argv: list[str] | None = None) -> int:
                 server.server_close()
             return 0
 
+        need_persist = args.command == "ask"
+        need_pass2 = args.command != "signal" and not (
+            args.command == "site" and not args.draft_agenda
+        )
+        need_site_rankings = (
+            args.command == "select-patients" and args.format == "json"
+        )
         conn, signal_bundle, selection_bundle = _prepare_runtime_context(
-            args.data_dir, args.state_file, args.strict
+            args.data_dir,
+            args.state_file,
+            args.strict,
+            persist_tables=need_persist,
+            need_selection_pass2=need_pass2,
+            include_site_rankings=need_site_rankings,
         )
         try:
             if args.command == "portfolio":
@@ -917,18 +1084,17 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
 
             if args.command == "select-patients":
-                risk_map = {s["site_id"]: s["risk_score"] for s in signal_bundle["sites"]}
-                sel = run_trial_selection(
-                    conn,
+                evals = filter_selection_evaluations(
+                    selection_bundle["_all_evaluations"],
+                    selection_bundle["_patients_by_id"],
+                    selection_bundle["_best_study_by_patient"],
+                    selection_bundle["_valid_study_ids"],
                     study_id=args.study_id,
                     status_filter=args.status,
                     site_id_filter=args.site_id,
                     region_filter=args.region,
                     min_score=args.min_score,
-                    site_risk_scores=risk_map,
-                    persist_table=False,
                 )
-                evals = sel["evaluations"]
                 single_audit = None
                 if args.patient_id:
                     evals = [e for e in evals if e["patient_id"] == args.patient_id]
@@ -939,12 +1105,12 @@ def main(argv: list[str] | None = None) -> int:
                     single_audit = evals[0]
 
                 evals_limited = evals[: max(1, args.limit)]
-                pat_map = {p["patient_id"]: p for p in sel["patients"]}
+                pat_map = selection_bundle["_patients_by_id"]
                 if args.format == "json":
                     print(
                         json.dumps(
                             {
-                                "summary_by_study": sel["summary_by_study"],
+                                "summary_by_study": selection_bundle["summary_by_study"],
                                 "count": len(evals),
                                 "evaluations": evals_limited,
                             },
@@ -954,7 +1120,7 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     print(
                         _format_selection_markdown(
-                            evals_limited, pat_map, sel["summary_by_study"], single_audit
+                            evals_limited, pat_map, selection_bundle["summary_by_study"], single_audit
                         )
                     )
                 return 0

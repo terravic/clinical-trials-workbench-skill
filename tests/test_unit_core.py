@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import shutil
 import tempfile
+import threading
 import unittest
+from urllib.request import Request, urlopen
 
 from scripts import (
     ClinicalRangeValidationError,
@@ -23,10 +26,17 @@ from scripts.action_drafter import (
     record_signal_feedback,
 )
 from scripts.analytics_assistant import answer_analytics_question, validate_readonly_sql
+from scripts.build_dashboard import compile_workspace_bundle, write_dashboard_from_bundle
 from scripts.data_ingestor import PIIGuardrailScanner, ingest_workspace_data
 from scripts.generate_synthetic_data import generate_all_synthetic_data
 from scripts.signal_engine import SIGNAL_FAMILIES, evaluate_signals_and_sites, load_signal_rules
-from scripts.trial_selector import run_trial_selection
+from scripts.trial_selector import (
+    evaluate_selection_criteria_once,
+    filter_selection_evaluations,
+    finalize_selection_with_site_risks,
+    run_trial_selection,
+)
+from scripts.workbench_cli import create_workbench_http_server
 
 
 class TestPIIGuardrails(unittest.TestCase):
@@ -63,6 +73,42 @@ class TestPIIGuardrails(unittest.TestCase):
         self.assertEqual(len(violations), 1)
         self.assertIn("[REDACTED]", violations[0])
         self.assertNotIn("SENSITIVE-RAW-TOKEN", violations[0])
+
+    def test_fast_path_and_csv_scanner_boundary_parity(self) -> None:
+        cases = [
+            {"patient_id": "P-1", "age_years": "0", "notes": "123-45-6789"},
+            {"patient_id": "P-2", "age_years": "89", "notes": "415-555-0199"},
+            {"patient_id": "P-3", "age_years": "90", "notes": "a@b.co"},
+            {"patient_id": "P-4", "age_years": "-1", "notes": "ok@demo.example"},
+            {"patient_id": "P-5", "age_years": "55", "notes": "ok@example.com ok@example.org ok@example.net"},
+            {"patient_id": "P-6", "age_years": "45", "notes": "123-45-678 415-555-019"},
+            {"patient_id": "P-7", "  PATIENT_NAME ": "Hidden", "age_years": "40", "notes": "clean"},
+            {"patient_id": "P-8", "age_years": "BAD-AGE", "notes": ""},
+        ]
+        for idx, rec in enumerate(cases, start=1):
+            key_meta = PIIGuardrailScanner.prepare_csv_key_meta(list(rec.keys()))
+            v_generic = PIIGuardrailScanner.scan_record("test.csv", idx, rec)
+            v_csv = PIIGuardrailScanner.scan_csv_record("test.csv", idx, rec, key_meta)
+            self.assertEqual(v_csv, v_generic, f"Parity mismatch on case {idx}: {rec}")
+
+        # Verify exact boundary triggers
+        self.assertEqual(len(PIIGuardrailScanner.scan_record("t.csv", 1, cases[0])), 1)  # 11-char SSN
+        self.assertEqual(len(PIIGuardrailScanner.scan_record("t.csv", 2, cases[1])), 1)  # 12-char phone
+        self.assertEqual(len(PIIGuardrailScanner.scan_record("t.csv", 3, cases[2])), 2)  # age 90 + a@b.co
+        self.assertEqual(len(PIIGuardrailScanner.scan_record("t.csv", 4, cases[3])), 1)  # negative age, .example ok
+        self.assertEqual(PIIGuardrailScanner.scan_record("t.csv", 5, cases[4]), [])      # reserved domains ok
+        self.assertEqual(PIIGuardrailScanner.scan_record("t.csv", 6, cases[5]), [])      # near-miss lengths ok
+        self.assertEqual(len(PIIGuardrailScanner.scan_record("t.csv", 7, cases[6])), 1)  # forbidden header
+
+        # Verify scalar fast-skip and nested dict/list recursion
+        nested = {
+            "count": 42,
+            "ratio": 1.25,
+            "flag": True,
+            "meta": {"contact_note": "reach a@b.co", "items": ["ok", "123-45-6789"]},
+        }
+        v_nested = PIIGuardrailScanner.scan_record("nested.json", "N-1", nested)
+        self.assertEqual(len(v_nested), 2)
 
 
 class TestIngestionEdgeCases(unittest.TestCase):
@@ -180,6 +226,53 @@ class TestTrialSelectionAndSignalEngines(unittest.TestCase):
         with self.assertRaises(EntityNotFoundError):
             run_trial_selection(self.conn, study_id="NCT-DOES-NOT-EXIST", persist_table=False)
 
+    def test_single_pass_pipeline_matches_two_pass_exactly(self) -> None:
+        conn_fast, _ = ingest_workspace_data(strict=True)
+        try:
+            precompute = evaluate_selection_criteria_once(conn_fast)
+            sig_fast = evaluate_signals_and_sites(
+                conn_fast,
+                local_elig_by_site=precompute.local_elig_by_site,
+                persist_tables=False,
+            )
+            risk_map = {s["site_id"]: s["risk_score"] for s in sig_fast["sites"]}
+            sel_fast = finalize_selection_with_site_risks(
+                conn_fast,
+                precompute,
+                site_risk_scores=risk_map,
+                persist_table=False,
+                include_site_rankings=True,
+            )
+
+            self.assertEqual(sig_fast, self.sig_bundle)
+            self.assertEqual(sel_fast["patients"], self.sel_bundle["patients"])
+            self.assertEqual(sel_fast["evaluations"], self.sel_bundle["evaluations"])
+            self.assertEqual(sel_fast["summary_by_study"], self.sel_bundle["summary_by_study"])
+
+            # Verify filtered selection queries match run_trial_selection identically
+            filter_cases = [
+                {"study_id": "NCT-SYN-0101", "status_filter": "ELIGIBLE"},
+                {"status_filter": "POTENTIAL_NEEDS_LABS", "region_filter": "NA"},
+                {"site_id_filter": "SITE-101", "min_score": 85},
+            ]
+            for kwargs in filter_cases:
+                expected = run_trial_selection(
+                    self.conn,
+                    site_risk_scores=risk_map,
+                    persist_table=False,
+                    **kwargs,
+                )["evaluations"]
+                actual = filter_selection_evaluations(
+                    sel_fast["_all_evaluations"],
+                    sel_fast["_patients_by_id"],
+                    sel_fast["_best_study_by_patient"],
+                    sel_fast["_valid_study_ids"],
+                    **kwargs,
+                )
+                self.assertEqual(actual, expected, f"Filter parity mismatch for {kwargs}")
+        finally:
+            conn_fast.close()
+
 
 class TestSQLSandboxingAndFeedbackState(unittest.TestCase):
     """Verify multi-layer read-only SQLite guardrails, HITL recovery, and reviewer data rights."""
@@ -268,6 +361,109 @@ class TestSQLSandboxingAndFeedbackState(unittest.TestCase):
             remaining = load_feedback_state(state_path, strict=True)
             self.assertNotIn("SIG-1001", remaining)
             self.assertIn("SIG-1002", remaining)
+
+
+class TestHTTPServerCacheInvalidation(unittest.TestCase):
+    """Verify HTTP bundle and SQLite caches stay coherent across mutations and external edits."""
+
+    def test_bundle_and_ask_cache_invalidate_on_feedback_delete_and_external_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            dash_file = tmp_path / "dashboard.html"
+            state_file = tmp_path / "state.json"
+
+            bundle = compile_workspace_bundle(state_file=str(state_file), strict=True)
+            _, raw_json = write_dashboard_from_bundle(output_path=dash_file, bundle=bundle)
+
+            server = create_workbench_http_server(
+                "127.0.0.1",
+                0,
+                dash_file,
+                state_file=str(state_file),
+                api_token="ephemeral-cache-token",
+                authenticated_reviewer="CRA-01",
+                initial_bundle_json=raw_json,
+            )
+            port = server.server_address[1]
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            auth_headers = {
+                "Content-Type": "application/json",
+                "Authorization": "Bearer ephemeral-cache-token",
+            }
+
+            def _get_sig_bundle(sig_id: str) -> str:
+                req = Request(
+                    f"http://127.0.0.1:{port}/api/bundle",
+                    headers={"Authorization": "Bearer ephemeral-cache-token"},
+                    method="GET",
+                )
+                with urlopen(req, timeout=5) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                return next(s["disposition"] for s in payload["signals"] if s["signal_id"] == sig_id)
+
+            def _get_sig_sql(sig_id: str) -> str:
+                req = Request(
+                    f"http://127.0.0.1:{port}/api/ask",
+                    data=json.dumps(
+                        {"sql": f"SELECT disposition FROM signals WHERE signal_id = '{sig_id}'"}
+                    ).encode("utf-8"),
+                    headers=auth_headers,
+                    method="POST",
+                )
+                with urlopen(req, timeout=5) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                return payload["rows"][0]["disposition"]
+
+            try:
+                # 1. Initial cached state is PENDING_REVIEW
+                self.assertEqual(_get_sig_bundle("SIG-1001"), "PENDING_REVIEW")
+                self.assertEqual(_get_sig_sql("SIG-1001"), "PENDING_REVIEW")
+
+                # 2. Mutate via POST /api/feedback -> both bundle and SQL cache update immediately
+                req_fb = Request(
+                    f"http://127.0.0.1:{port}/api/feedback",
+                    data=json.dumps(
+                        {
+                            "signal_id": "SIG-1001",
+                            "disposition": "ACCEPT",
+                            "note": "Cache verification",
+                            "reviewer_id": "CRA-01",
+                        }
+                    ).encode("utf-8"),
+                    headers=auth_headers,
+                    method="POST",
+                )
+                with urlopen(req_fb, timeout=5) as resp:
+                    self.assertEqual(resp.status, 200)
+                self.assertEqual(_get_sig_bundle("SIG-1001"), "ACCEPT")
+                self.assertEqual(_get_sig_sql("SIG-1001"), "ACCEPT")
+
+                # 3. Mutate via POST /api/user-data/delete -> both revert to PENDING_REVIEW
+                req_del = Request(
+                    f"http://127.0.0.1:{port}/api/user-data/delete",
+                    data=json.dumps({"reviewer_id": "CRA-01"}).encode("utf-8"),
+                    headers=auth_headers,
+                    method="POST",
+                )
+                with urlopen(req_del, timeout=5) as resp:
+                    self.assertEqual(resp.status, 200)
+                self.assertEqual(_get_sig_bundle("SIG-1001"), "PENDING_REVIEW")
+                self.assertEqual(_get_sig_sql("SIG-1001"), "PENDING_REVIEW")
+
+                # 4. External state file mutation outside HTTP -> stat fingerprint invalidates cache
+                record_signal_feedback(
+                    "SIG-1001",
+                    "DISMISS",
+                    note="External CLI update",
+                    reviewer_id="CRA-01",
+                    state_file=state_file,
+                )
+                self.assertEqual(_get_sig_bundle("SIG-1001"), "DISMISS")
+                self.assertEqual(_get_sig_sql("SIG-1001"), "DISMISS")
+            finally:
+                server.shutdown()
+                server.server_close()
 
 
 if __name__ == "__main__":

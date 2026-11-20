@@ -14,6 +14,8 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from typing import Any
 
 from scripts import DEFAULT_DASHBOARD_PATH, PROJECT_ROOT, configure_logging
@@ -24,11 +26,40 @@ from scripts.action_drafter import (
 from scripts.analytics_assistant import build_analytics_catalog
 from scripts.data_ingestor import ingest_workspace_data
 from scripts.signal_engine import evaluate_signals_and_sites
-from scripts.trial_selector import run_trial_selection
+from scripts.trial_selector import (
+    evaluate_selection_criteria_once,
+    finalize_selection_with_site_risks,
+)
+
+_THEME_CACHE_TTL_SEC = 60.0
+_THEME_CACHE_LOCK = threading.Lock()
+_theme_cache: tuple[str, str, float] | None = None
+
+_COMPACT_EVAL_KEYS: tuple[str, ...] = (
+    "patient_id",
+    "study_id",
+    "protocol_code",
+    "classification",
+    "match_score",
+    "recommended_site_id",
+    "recommended_site_score",
+    "failed_criteria",
+    "missing_criteria",
+)
 
 
-def detect_host_system_theme() -> str:
-    """Detect native host OS light/dark theme preference across macOS, Windows, and Linux."""
+def _get_cached_theme() -> str | None:
+    gtk_env = os.environ.get("GTK_THEME", "")
+    now = time.monotonic()
+    with _THEME_CACHE_LOCK:
+        if _theme_cache is not None:
+            cached_gtk, cached_theme, cached_ts = _theme_cache
+            if cached_gtk == gtk_env and (now - cached_ts) < _THEME_CACHE_TTL_SEC:
+                return cached_theme
+    return None
+
+
+def _probe_host_system_theme(gtk_env: str) -> str:
     try:
         if sys.platform == "darwin":
             proc = subprocess.run(
@@ -53,8 +84,7 @@ def detect_host_system_theme() -> str:
                 return "light" if int(val) == 1 else "dark"
 
         # Linux checks: GTK_THEME env, gsettings, kdeglobals
-        gtk_env = os.environ.get("GTK_THEME", "").lower()
-        if "dark" in gtk_env:
+        if "dark" in gtk_env.lower():
             return "dark"
 
         for cmd in (
@@ -80,24 +110,73 @@ def detect_host_system_theme() -> str:
     return "light"
 
 
+def detect_host_system_theme(force_refresh: bool = False) -> str:
+    """Detect native host OS light/dark theme preference across macOS, Windows, and Linux."""
+    global _theme_cache
+    if not force_refresh:
+        cached = _get_cached_theme()
+        if cached is not None:
+            return cached
+    gtk_env = os.environ.get("GTK_THEME", "")
+    theme = _probe_host_system_theme(gtk_env)
+    with _THEME_CACHE_LOCK:
+        _theme_cache = (gtk_env, theme, time.monotonic())
+    return theme
+
+
 def compile_workspace_bundle(
     data_dir: str | Path | None = None,
     state_file: str | Path | None = None,
     strict: bool = False,
 ) -> dict[str, Any]:
     """Run full Listen -> Detect -> Assess -> Action + Selection pipeline and emit JSON bundle."""
+    # Overlap cold OS theme subprocess probe with data ingestion & signal processing
+    resolved_theme = _get_cached_theme()
+    theme_holder: list[str] = []
+    theme_thread: threading.Thread | None = None
+    if resolved_theme is None:
+        def _bg_probe() -> None:
+            theme_holder.append(detect_host_system_theme())
+
+        theme_thread = threading.Thread(target=_bg_probe, daemon=True)
+        theme_thread.start()
+
     conn, ingestion_report = ingest_workspace_data(data_dir=data_dir, strict=strict)
     try:
         feedback_map = load_feedback_state(state_file=state_file, strict=strict)
-        # First pass selection to populate eligibility_assessments for SR-ENR-05 signal rule
-        prelim_selection = run_trial_selection(conn, persist_table=True)
-        signal_bundle = evaluate_signals_and_sites(conn, feedback_map=feedback_map)
-        site_risk_map = {s["site_id"]: s["risk_score"] for s in signal_bundle["sites"]}
-        # Re-rank candidate site placements incorporating live site risk scores
-        selection_bundle = run_trial_selection(
-            conn, site_risk_scores=site_risk_map, persist_table=True
+        # Single-pass criterion evaluation + Pass-1 local site counts for SR-ENR-05
+        precompute = evaluate_selection_criteria_once(conn)
+        signal_bundle = evaluate_signals_and_sites(
+            conn,
+            feedback_map=feedback_map,
+            local_elig_by_site=precompute.local_elig_by_site,
+            persist_tables=True,
         )
-        del prelim_selection
+        site_risk_map = {s["site_id"]: s["risk_score"] for s in signal_bundle["sites"]}
+        # Attach live site placement scores reusing Pass-1 criteria without re-evaluating criteria
+        selection_full = finalize_selection_with_site_risks(
+            conn,
+            precompute,
+            site_risk_scores=site_risk_map,
+            persist_table=True,
+            include_site_rankings=False,
+        )
+
+        # Schema-preserving payload deduplication: evaluations omit criteria_audit already on patients[i],
+        # and site records omit redundant site["events"] (duplicate of safety_events + edc_visits).
+        compact_evaluations = [
+            {k: ev[k] for k in _COMPACT_EVAL_KEYS}
+            for ev in selection_full["evaluations"]
+        ]
+        selection_bundle = {
+            "patients": selection_full["patients"],
+            "evaluations": compact_evaluations,
+            "summary_by_study": selection_full["summary_by_study"],
+        }
+        compact_sites = [
+            {k: v for k, v in site.items() if k != "events"}
+            for site in signal_bundle["sites"]
+        ]
 
         portfolio_summary = build_portfolio_executive_briefing(
             signal_bundle, selection_bundle, cra_filter="ALL", include_peer_sites=True
@@ -115,17 +194,21 @@ def compile_workspace_bundle(
     finally:
         conn.close()
 
+    if theme_thread is not None:
+        theme_thread.join(timeout=2.0)
+        resolved_theme = theme_holder[0] if theme_holder else "light"
+
     return {
         "metadata": {
             "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "system_theme": detect_host_system_theme(),
+            "system_theme": resolved_theme or "light",
             "reference_date": signal_bundle["reference_date"],
             "schema_version": "1.0.0",
             "synthetic_data_only": True,
         },
         "portfolio_summary": portfolio_summary,
         "studies": studies,
-        "sites": signal_bundle["sites"],
+        "sites": compact_sites,
         "signals": signal_bundle["signals"],
         "signal_families": signal_bundle["signal_families"],
         "patient_selection": selection_bundle,
@@ -1438,6 +1521,117 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       activeAnalyticsResult: WORKSPACE.analytics_catalog[0] || null
     };
 
+    /* O(1) lookup indices & derived view caches rebuilt on boot and SSE updates */
+    let INDEX = {
+      sitesById: Object.create(null),
+      signalsById: Object.create(null),
+      signalsBySite: Object.create(null),
+      patientsById: Object.create(null),
+      patientsBySite: Object.create(null),
+      sitesByStudy: Object.create(null),
+      siteSearchHaystack: Object.create(null),
+      patientSearchHaystack: Object.create(null),
+      patientNorm3d: Object.create(null),
+      peerWeeklyAvg: [],
+      generation: 0
+    };
+    let patientFilterCache = { key: "", list: [], eligCount: 0, labsCount: 0 };
+    let nodeLayoutCache = { key: "", layout: null };
+
+    function invalidatePatientFilterCache() {
+      patientFilterCache.key = "";
+      nodeLayoutCache.key = "";
+    }
+
+    function invalidateNodeLayoutCache() {
+      nodeLayoutCache.key = "";
+    }
+
+    function rebuildWorkspaceIndices() {
+      const sitesById = Object.create(null);
+      const signalsById = Object.create(null);
+      const signalsBySite = Object.create(null);
+      const patientsById = Object.create(null);
+      const patientsBySite = Object.create(null);
+      const sitesByStudy = Object.create(null);
+      const siteSearchHaystack = Object.create(null);
+      const patientSearchHaystack = Object.create(null);
+      const patientNorm3d = Object.create(null);
+
+      const sites = WORKSPACE.sites || [];
+      let trendLen = 8;
+      sites.forEach(function (s) {
+        sitesById[s.site_id] = s;
+        signalsBySite[s.site_id] = [];
+        if (!sitesByStudy[s.study_id]) sitesByStudy[s.study_id] = [];
+        sitesByStudy[s.study_id].push(s);
+        siteSearchHaystack[s.site_id] = (
+          s.site_id + " " + s.site_name + " " + s.protocol_code + " " + s.country_code + " " + s.region
+        ).toLowerCase();
+        if (s.weekly_signal_trend && s.weekly_signal_trend.length > trendLen) {
+          trendLen = s.weekly_signal_trend.length;
+        }
+      });
+
+      const peerWeeklyAvg = [];
+      for (let i = 0; i < trendLen; i++) {
+        if (!sites.length) {
+          peerWeeklyAvg.push(2);
+          continue;
+        }
+        let sum = 0;
+        for (let j = 0; j < sites.length; j++) {
+          const arr = sites[j].weekly_signal_trend || [];
+          sum += Number(arr[i] != null ? arr[i] : 0);
+        }
+        peerWeeklyAvg.push(Number((sum / sites.length).toFixed(1)));
+      }
+
+      (WORKSPACE.signals || []).forEach(function (sig) {
+        signalsById[sig.signal_id] = sig;
+        if (!signalsBySite[sig.site_id]) signalsBySite[sig.site_id] = [];
+        signalsBySite[sig.site_id].push(sig);
+      });
+
+      ((WORKSPACE.patient_selection && WORKSPACE.patient_selection.patients) || []).forEach(function (p) {
+        patientsById[p.patient_id] = p;
+        if (p.recommended_site_id) {
+          if (!patientsBySite[p.recommended_site_id]) patientsBySite[p.recommended_site_id] = [];
+          patientsBySite[p.recommended_site_id].push(p);
+        }
+        patientSearchHaystack[p.patient_id] = (
+          p.patient_id + " " + p.primary_icd10 + " " + p.disease_stage + " " + p.primary_match_protocol + " " + (p.recommended_site_id || "")
+        ).toLowerCase();
+        const L = p.labs || {};
+        const bioVal = Number(L.biomarker_composite_z != null ? L.biomarker_composite_z : 40);
+        const egfrNum = Number(L.egfr_ml_min != null ? L.egfr_ml_min : 48);
+        const sevVal = Number(p.severity_index != null ? p.severity_index : 50);
+        patientNorm3d[p.patient_id] = {
+          bx: Math.max(-0.96, Math.min(0.96, (bioVal / 100) * 2 - 1)),
+          ey: Math.max(-0.96, Math.min(0.96, (Math.min(110, egfrNum) / 110) * 2 - 1)),
+          sz: Math.max(-0.96, Math.min(0.96, (sevVal / 100) * 2 - 1)),
+          bioVal: bioVal,
+          egfrVal: L.egfr_ml_min,
+          sevVal: sevVal
+        };
+      });
+
+      INDEX = {
+        sitesById: sitesById,
+        signalsById: signalsById,
+        signalsBySite: signalsBySite,
+        patientsById: patientsById,
+        patientsBySite: patientsBySite,
+        sitesByStudy: sitesByStudy,
+        siteSearchHaystack: siteSearchHaystack,
+        patientSearchHaystack: patientSearchHaystack,
+        patientNorm3d: patientNorm3d,
+        peerWeeklyAvg: peerWeeklyAvg,
+        generation: INDEX.generation + 1
+      };
+      invalidatePatientFilterCache();
+    }
+
     /* Merge persisted localStorage HITL feedback into in-memory signals */
     function syncLocalFeedback() {
       const merged = Object.assign({}, WORKSPACE.feedback_state || {}, STATE.localFeedback);
@@ -1449,6 +1643,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       });
     }
     syncLocalFeedback();
+    rebuildWorkspaceIndices();
 
     /* --- THEME RESOLUTION (DESIGN.md Section 3) --- */
     const mediaDark = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
@@ -1539,13 +1734,11 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 
     /* --- SCOPED SITES HELPER --- */
     function getScopedSites() {
+      if (STATE.craScope === "ALL") return WORKSPACE.sites;
       return WORKSPACE.sites.filter(function (s) {
-        if (STATE.craScope !== "ALL") {
-          const matchPrimary = s.assigned_cra_id === STATE.craScope;
-          const matchPeer = STATE.includePeer && s.peer_cra_id === STATE.craScope;
-          if (!matchPrimary && !matchPeer) return false;
-        }
-        return true;
+        const matchPrimary = s.assigned_cra_id === STATE.craScope;
+        const matchPeer = STATE.includePeer && s.peer_cra_id === STATE.craScope;
+        return matchPrimary || matchPeer;
       });
     }
 
@@ -1555,7 +1748,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         if (STATE.portfolioStudy !== "ALL" && s.study_id !== STATE.portfolioStudy) return false;
         if (STATE.portfolioTier !== "ALL" && s.priority_tier !== STATE.portfolioTier) return false;
         if (q) {
-          const hay = (s.site_id + " " + s.site_name + " " + s.protocol_code + " " + s.country_code + " " + s.region).toLowerCase();
+          const hay = INDEX.siteSearchHaystack[s.site_id] || "";
           if (hay.indexOf(q) === -1) return false;
         }
         return true;
@@ -1645,33 +1838,47 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       });
     }
 
+    /* Delegated click handler for Portfolio Inspect Site buttons */
+    document.getElementById("portfolio-sites-tbody").addEventListener("click", function (ev) {
+      const btn = ev.target && ev.target.closest ? ev.target.closest("[data-open-site]") : null;
+      if (!btn) return;
+      STATE.selectedSiteId = btn.getAttribute("data-open-site");
+      STATE.checkedSignalIds = new Set();
+      document.getElementById("site-view-selector").value = STATE.selectedSiteId;
+      switchView("site");
+    });
+
     function renderPortfolio() {
       syncSortHeaderAria();
       const scopedSites = getScopedSites();
-      const scopedIds = new Set(scopedSites.map(function (s) { return s.site_id; }));
-      const activeSignals = WORKSPACE.signals.filter(function (sig) {
-        return scopedIds.has(sig.site_id) && sig.disposition !== "DISMISS";
-      });
-
-      const prioCnt = scopedSites.filter(function (s) { return s.priority_tier === "Priority Action Required"; }).length;
-      const impCnt = scopedSites.filter(function (s) { return s.priority_tier === "Important Signals Next"; }).length;
-      const monCnt = scopedSites.filter(function (s) { return s.priority_tier === "Continue to Monitor"; }).length;
-      const critCnt = activeSignals.filter(function (s) { return s.severity === "CRITICAL"; }).length;
+      let prioCnt = 0, impCnt = 0, monCnt = 0, activeSigCnt = 0, critCnt = 0;
+      for (let i = 0; i < scopedSites.length; i++) {
+        const s = scopedSites[i];
+        if (s.priority_tier === "Priority Action Required") prioCnt++;
+        else if (s.priority_tier === "Important Signals Next") impCnt++;
+        else monCnt++;
+        const sSigs = INDEX.signalsBySite[s.site_id] || [];
+        for (let j = 0; j < sSigs.length; j++) {
+          if (sSigs[j].disposition !== "DISMISS") {
+            activeSigCnt++;
+            if (sSigs[j].severity === "CRITICAL") critCnt++;
+          }
+        }
+      }
 
       document.getElementById("briefing-ref-date").textContent = "Reference Date: " + WORKSPACE.metadata.reference_date + " | Synthetic HCLS Mode";
       document.getElementById("executive-briefing-text").textContent = WORKSPACE.portfolio_summary.executive_briefing;
 
       document.getElementById("kpi-priority-sites").textContent = prioCnt + " / " + scopedSites.length;
       document.getElementById("kpi-tier-breakdown").textContent = "Important: " + impCnt + " | Nominal: " + monCnt;
-      document.getElementById("kpi-active-signals").textContent = String(activeSignals.length);
+      document.getElementById("kpi-active-signals").textContent = String(activeSigCnt);
       document.getElementById("kpi-critical-signals").textContent = critCnt + " CRITICAL across 7 families";
       document.getElementById("kpi-sae-days").textContent = WORKSPACE.portfolio_summary.submitted_sae_median_days + "d";
       document.getElementById("kpi-eligible-pool").textContent = String(WORKSPACE.portfolio_summary.eligible_patient_count);
       document.getElementById("kpi-needs-labs-pool").textContent = WORKSPACE.portfolio_summary.potential_needs_labs_count + " awaiting lab refresh";
 
       const rows = getFilteredPortfolioSites();
-      const tbody = document.getElementById("portfolio-sites-tbody");
-      tbody.innerHTML = rows.map(function (s) {
+      document.getElementById("portfolio-sites-tbody").innerHTML = rows.map(function (s) {
         return (
           '<tr data-site-row="' + escHtml(s.site_id) + '">' +
           '<td class="mono"><strong>' + escHtml(s.site_id) + '</strong></td>' +
@@ -1690,32 +1897,23 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         );
       }).join("");
 
-      tbody.querySelectorAll("[data-open-site]").forEach(function (btn) {
-        btn.addEventListener("click", function () {
-          STATE.selectedSiteId = btn.getAttribute("data-open-site");
-          STATE.checkedSignalIds = new Set();
-          document.getElementById("site-view-selector").value = STATE.selectedSiteId;
-          switchView("site");
-        });
-      });
-
       drawHeatmapPlot();
       drawSaeTrendPlot();
     }
 
     /* --- LEVEL 2 SINGLE-SITE RENDERER --- */
     function getSelectedSite() {
-      return WORKSPACE.sites.find(function (s) { return s.site_id === STATE.selectedSiteId; }) || WORKSPACE.sites[0];
+      return INDEX.sitesById[STATE.selectedSiteId] || WORKSPACE.sites[0];
     }
 
     function compileSiteDraft(site, mode) {
-      const siteSignals = WORKSPACE.signals.filter(function (sig) {
-        if (sig.site_id !== site.site_id || sig.disposition === "DISMISS") return false;
+      const siteSignals = (INDEX.signalsBySite[site.site_id] || []).filter(function (sig) {
+        if (sig.disposition === "DISMISS") return false;
         if (STATE.checkedSignalIds.size > 0 && !STATE.checkedSignalIds.has(sig.signal_id)) return false;
         return true;
       });
-      const matchedCands = WORKSPACE.patient_selection.patients.filter(function (p) {
-        return p.recommended_site_id === site.site_id && (p.primary_classification === "ELIGIBLE" || p.primary_classification === "POTENTIAL_NEEDS_LABS");
+      const matchedCands = (INDEX.patientsBySite[site.site_id] || []).filter(function (p) {
+        return p.primary_classification === "ELIGIBLE" || p.primary_classification === "POTENTIAL_NEEDS_LABS";
       });
 
       if (mode === "email") {
@@ -1768,6 +1966,37 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       );
     }
 
+    /* Delegated handlers for Level 2 Site subtab actions */
+    const siteSubtabContainerEl = document.getElementById("site-subtab-container");
+    siteSubtabContainerEl.addEventListener("change", function (ev) {
+      const cb = ev.target && ev.target.closest ? ev.target.closest("[data-sig-check]") : null;
+      if (!cb) return;
+      const site = getSelectedSite();
+      if (!site) return;
+      const sigs = INDEX.signalsBySite[site.site_id] || [];
+      if (STATE.checkedSignalIds.size === 0) {
+        sigs.forEach(function (x) { STATE.checkedSignalIds.add(x.signal_id); });
+      }
+      const id = cb.getAttribute("data-sig-check");
+      if (cb.checked) STATE.checkedSignalIds.add(id);
+      else STATE.checkedSignalIds.delete(id);
+      document.getElementById("site-draft-output").textContent = compileSiteDraft(site, STATE.siteDraftMode);
+    });
+    siteSubtabContainerEl.addEventListener("click", function (ev) {
+      const sigBtn = ev.target && ev.target.closest ? ev.target.closest("[data-open-signal]") : null;
+      if (sigBtn) {
+        STATE.selectedSignalId = sigBtn.getAttribute("data-open-signal");
+        document.getElementById("signal-view-selector").value = STATE.selectedSignalId;
+        switchView("signal");
+        return;
+      }
+      const patBtn = ev.target && ev.target.closest ? ev.target.closest("[data-inspect-pat]") : null;
+      if (patBtn) {
+        STATE.selectedPatientId = patBtn.getAttribute("data-inspect-pat");
+        switchView("selection");
+      }
+    });
+
     function renderSingleSite() {
       const site = getSelectedSite();
       if (!site) return;
@@ -1789,11 +2018,11 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 
       document.getElementById("site-ai-summary").textContent = site.site_summary;
 
-      const container = document.getElementById("site-subtab-container");
+      const container = siteSubtabContainerEl;
       const sub = STATE.siteSubtab;
 
       if (sub === "signals") {
-        const sigs = WORKSPACE.signals.filter(function (s) { return s.site_id === site.site_id; });
+        const sigs = INDEX.signalsBySite[site.site_id] || [];
         container.innerHTML =
           '<table><thead><tr><th scope="col">Include</th><th scope="col">Signal</th><th scope="col">Family</th><th scope="col">Severity</th><th scope="col">Title</th><th scope="col">Disposition</th><th scope="col">Evidence</th></tr></thead><tbody>' +
           (sigs.length ? sigs.map(function (sig) {
@@ -1811,26 +2040,6 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
             );
           }).join("") : '<tr><td colspan="7">Zero signals triggered for this site.</td></tr>') +
           "</tbody></table>";
-
-        container.querySelectorAll("[data-sig-check]").forEach(function (cb) {
-          cb.addEventListener("change", function () {
-            const allSiteIds = sigs.map(function (x) { return x.signal_id; });
-            if (STATE.checkedSignalIds.size === 0) {
-              allSiteIds.forEach(function (id) { STATE.checkedSignalIds.add(id); });
-            }
-            const id = cb.getAttribute("data-sig-check");
-            if (cb.checked) STATE.checkedSignalIds.add(id);
-            else STATE.checkedSignalIds.delete(id);
-            document.getElementById("site-draft-output").textContent = compileSiteDraft(site, STATE.siteDraftMode);
-          });
-        });
-        container.querySelectorAll("[data-open-signal]").forEach(function (btn) {
-          btn.addEventListener("click", function () {
-            STATE.selectedSignalId = btn.getAttribute("data-open-signal");
-            document.getElementById("signal-view-selector").value = STATE.selectedSignalId;
-            switchView("signal");
-          });
-        });
       } else if (sub === "events") {
         const saes = site.safety_events || [];
         const visits = site.edc_visits || [];
@@ -1873,9 +2082,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
           }).join("") : '<tr><td colspan="7">Zero protocol deviations logged at this site.</td></tr>') +
           "</tbody></table>";
       } else {
-        const cands = WORKSPACE.patient_selection.patients.filter(function (p) {
-          return p.recommended_site_id === site.site_id;
-        });
+        const cands = INDEX.patientsBySite[site.site_id] || [];
         container.innerHTML =
           '<table><thead><tr><th scope="col">Patient ID</th><th scope="col">Age/Sex</th><th scope="col">ICD-10</th><th scope="col">Classification</th><th scope="col" class="num">Match Score</th><th scope="col">Action</th></tr></thead><tbody>' +
           (cands.length ? cands.map(function (p) {
@@ -1885,13 +2092,6 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
               '</td><td><button type="button" data-inspect-pat="' + escHtml(p.patient_id) + '">Open in Trial Selector</button></td></tr>';
           }).join("") : '<tr><td colspan="6">No candidates currently routed to this site.</td></tr>') +
           "</tbody></table>";
-
-        container.querySelectorAll("[data-inspect-pat]").forEach(function (b) {
-          b.addEventListener("click", function () {
-            STATE.selectedPatientId = b.getAttribute("data-inspect-pat");
-            switchView("selection");
-          });
-        });
       }
 
       document.getElementById("site-draft-output").textContent = compileSiteDraft(site, STATE.siteDraftMode);
@@ -1899,7 +2099,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 
     /* --- LEVEL 3 SIGNAL EVIDENCE RENDERER --- */
     function renderSignalDetail() {
-      const sig = WORKSPACE.signals.find(function (s) { return s.signal_id === STATE.selectedSignalId; }) || WORKSPACE.signals[0];
+      const sig = INDEX.signalsById[STATE.selectedSignalId] || WORKSPACE.signals[0];
       if (!sig) return;
       document.getElementById("signal-view-selector").value = sig.signal_id;
       const sevBadge = document.getElementById("signal-severity-badge");
@@ -1956,11 +2156,12 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     }
 
     function submitFeedback(disposition) {
-      const sig = WORKSPACE.signals.find(function (s) { return s.signal_id === STATE.selectedSignalId; });
+      const sig = INDEX.signalsById[STATE.selectedSignalId];
       if (!sig) return;
       const note = document.getElementById("signal-feedback-note").value.trim();
       sig.disposition = disposition;
       sig.reviewer_note = note;
+      invalidateNodeLayoutCache();
       STATE.localFeedback[sig.signal_id] = {
         signal_id: sig.signal_id,
         disposition: disposition,
@@ -1981,23 +2182,100 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     }
 
     /* --- VIEW 4: CLINICAL TRIAL SELECTION RENDERER --- */
-    function getFilteredPatients() {
+    function getFilteredPatientsMeta() {
       const q = STATE.patientSearch.trim().toLowerCase();
-      return WORKSPACE.patient_selection.patients.filter(function (p) {
-        if (STATE.patientStudy !== "ALL" && p.primary_match_study_id !== STATE.patientStudy) return false;
-        if (STATE.patientStatus !== "ALL" && p.primary_classification !== STATE.patientStatus) return false;
+      const cacheKey = INDEX.generation + "|" + STATE.patientStudy + "|" + STATE.patientStatus + "|" + q;
+      if (patientFilterCache.key === cacheKey) return patientFilterCache;
+
+      const allPats = WORKSPACE.patient_selection.patients;
+      const list = [];
+      let eligCount = 0, labsCount = 0;
+      for (let i = 0; i < allPats.length; i++) {
+        const p = allPats[i];
+        if (STATE.patientStudy !== "ALL" && p.primary_match_study_id !== STATE.patientStudy) continue;
+        if (STATE.patientStatus !== "ALL" && p.primary_classification !== STATE.patientStatus) continue;
         if (q) {
-          const hay = (p.patient_id + " " + p.primary_icd10 + " " + p.disease_stage + " " + p.primary_match_protocol + " " + (p.recommended_site_id || "")).toLowerCase();
-          if (hay.indexOf(q) === -1) return false;
+          const hay = INDEX.patientSearchHaystack[p.patient_id] || "";
+          if (hay.indexOf(q) === -1) continue;
         }
-        return true;
-      });
+        list.push(p);
+        if (p.primary_classification === "ELIGIBLE") eligCount++;
+        else if (p.primary_classification === "POTENTIAL_NEEDS_LABS") labsCount++;
+      }
+      patientFilterCache = { key: cacheKey, list: list, eligCount: eligCount, labsCount: labsCount };
+      return patientFilterCache;
+    }
+
+    function getFilteredPatients() {
+      return getFilteredPatientsMeta().list;
+    }
+
+    const patientTbodyEl = document.getElementById("patient-selection-tbody");
+    patientTbodyEl.addEventListener("click", function (ev) {
+      const tr = ev.target && ev.target.closest ? ev.target.closest("[data-pat-row]") : null;
+      if (!tr) return;
+      selectPatientInView(tr.getAttribute("data-pat-row"));
+    });
+    patientTbodyEl.addEventListener("keydown", function (ev) {
+      if (ev.key !== "Enter" && ev.key !== " ") return;
+      const tr = ev.target && ev.target.closest ? ev.target.closest("[data-pat-row]") : null;
+      if (!tr) return;
+      ev.preventDefault();
+      selectPatientInView(tr.getAttribute("data-pat-row"));
+    });
+
+    function renderSelectedPatientDetails(fallbackList) {
+      const pat = INDEX.patientsById[STATE.selectedPatientId] || (fallbackList && fallbackList[0]) || WORKSPACE.patient_selection.patients[0];
+      if (!pat) return;
+      document.getElementById("selected-patient-label").textContent = pat.patient_id + " -> " + pat.primary_match_protocol + " (" + pat.primary_match_score + "/100)";
+      const L = pat.labs || {};
+      document.getElementById("selected-patient-labs").innerHTML = [
+        ["Stage / ICD-10", pat.disease_stage + " (" + pat.primary_icd10 + ")"],
+        ["eGFR / Bilirubin", (L.egfr_ml_min != null ? L.egfr_ml_min + " mL/min" : "Missing") + " / " + (L.bilirubin_mg_dl != null ? L.bilirubin_mg_dl + " mg/dL" : "Missing")],
+        ["Specialty Assay", L.egfr_mutation ? ("EGFR " + L.egfr_mutation + " | PD-L1 " + (L.pdl1_tps_pct ?? "NA") + "%") : (L.csf_ptau_pg_ml != null ? ("pTau " + L.csf_ptau_pg_ml + " pg/mL") : (L.fecal_calprotectin_ug_g != null ? ("Calprotectin " + L.fecal_calprotectin_ug_g) : ("LVEF " + (L.lvef_pct ?? "Missing") + "%")))],
+        ["Recommended Site", pat.recommended_site_id || "None (Ineligible)"]
+      ].map(function (pair) {
+        return '<div><div class="kv-label">' + escHtml(pair[0]) + '</div><div class="kv-val mono">' + escHtml(pair[1]) + "</div></div>";
+      }).join("");
+
+      document.getElementById("patient-criteria-tbody").innerHTML = (pat.criteria_audit || []).map(function (c) {
+        const bCls = c.status === "PASS" ? "badge-emerald" : (c.status === "MISSING_DATA" ? "badge-needs-labs" : "badge-ineligible");
+        return (
+          "<tr>" +
+          '<td class="mono">' + escHtml(c.criterion_id) + "</td>" +
+          '<td><span class="badge ' + bCls + '">[' + escHtml(c.status) + "]</span></td>" +
+          '<td class="mono">' + escHtml(c.observed) + "</td>" +
+          "<td>" + escHtml(c.requirement) + "</td>" +
+          "</tr>"
+        );
+      }).join("");
+    }
+
+    function selectPatientInView(patId) {
+      if (!patId || STATE.selectedPatientId === patId) return;
+      const prevRow = patientTbodyEl.querySelector("tr.selected-row");
+      if (prevRow) {
+        prevRow.classList.remove("selected-row");
+        prevRow.setAttribute("aria-selected", "false");
+      }
+      STATE.selectedPatientId = patId;
+      invalidateNodeLayoutCache();
+      const rows = patientTbodyEl.children;
+      for (let i = 0; i < rows.length; i++) {
+        if (rows[i].getAttribute("data-pat-row") === patId) {
+          rows[i].classList.add("selected-row");
+          rows[i].setAttribute("aria-selected", "true");
+          break;
+        }
+      }
+      renderSelectedPatientDetails(getFilteredPatients());
+      draw3DBiomarkerPlot();
+      drawNodeMapPlot();
     }
 
     function renderTrialSelection() {
       const filtered = getFilteredPatients();
-      const tbody = document.getElementById("patient-selection-tbody");
-      tbody.innerHTML = filtered.map(function (p) {
+      patientTbodyEl.innerHTML = filtered.map(function (p) {
         const isSel = p.patient_id === STATE.selectedPatientId;
         return (
           '<tr data-pat-row="' + escHtml(p.patient_id) + '" tabindex="0" aria-selected="' + (isSel ? "true" : "false") + '" class="' + (isSel ? "selected-row" : "") + '">' +
@@ -2014,46 +2292,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         );
       }).join("");
 
-      tbody.querySelectorAll("[data-pat-row]").forEach(function (tr) {
-        const activateRow = function () {
-          STATE.selectedPatientId = tr.getAttribute("data-pat-row");
-          renderTrialSelection();
-        };
-        tr.addEventListener("click", activateRow);
-        tr.addEventListener("keydown", function (ev) {
-          if (ev.key === "Enter" || ev.key === " ") {
-            ev.preventDefault();
-            activateRow();
-          }
-        });
-      });
-
-      const pat = WORKSPACE.patient_selection.patients.find(function (p) { return p.patient_id === STATE.selectedPatientId; }) || filtered[0] || WORKSPACE.patient_selection.patients[0];
-      if (pat) {
-        document.getElementById("selected-patient-label").textContent = pat.patient_id + " -> " + pat.primary_match_protocol + " (" + pat.primary_match_score + "/100)";
-        const L = pat.labs || {};
-        document.getElementById("selected-patient-labs").innerHTML = [
-          ["Stage / ICD-10", pat.disease_stage + " (" + pat.primary_icd10 + ")"],
-          ["eGFR / Bilirubin", (L.egfr_ml_min != null ? L.egfr_ml_min + " mL/min" : "Missing") + " / " + (L.bilirubin_mg_dl != null ? L.bilirubin_mg_dl + " mg/dL" : "Missing")],
-          ["Specialty Assay", L.egfr_mutation ? ("EGFR " + L.egfr_mutation + " | PD-L1 " + (L.pdl1_tps_pct ?? "NA") + "%") : (L.csf_ptau_pg_ml != null ? ("pTau " + L.csf_ptau_pg_ml + " pg/mL") : (L.fecal_calprotectin_ug_g != null ? ("Calprotectin " + L.fecal_calprotectin_ug_g) : ("LVEF " + (L.lvef_pct ?? "Missing") + "%")))],
-          ["Recommended Site", pat.recommended_site_id || "None (Ineligible)"]
-        ].map(function (pair) {
-          return '<div><div class="kv-label">' + escHtml(pair[0]) + '</div><div class="kv-val mono">' + escHtml(pair[1]) + "</div></div>";
-        }).join("");
-
-        document.getElementById("patient-criteria-tbody").innerHTML = (pat.criteria_audit || []).map(function (c) {
-          const bCls = c.status === "PASS" ? "badge-emerald" : (c.status === "MISSING_DATA" ? "badge-needs-labs" : "badge-ineligible");
-          return (
-            "<tr>" +
-            '<td class="mono">' + escHtml(c.criterion_id) + "</td>" +
-            '<td><span class="badge ' + bCls + '">[' + escHtml(c.status) + "]</span></td>" +
-            '<td class="mono">' + escHtml(c.observed) + "</td>" +
-            "<td>" + escHtml(c.requirement) + "</td>" +
-            "</tr>"
-          );
-        }).join("");
-      }
-
+      renderSelectedPatientDetails(filtered);
       draw3DBiomarkerPlot();
       drawNodeMapPlot();
     }
@@ -2158,13 +2397,18 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       return { canvas: surface, ctx: ctx, w: w, h: h };
     }
 
+    const _rgbCache = Object.create(null);
     function hexToRgb(hex) {
+      let cached = _rgbCache[hex];
+      if (cached) return cached;
       const clean = hex.replace("#", "");
-      return [
+      cached = [
         parseInt(clean.substring(0, 2), 16),
         parseInt(clean.substring(2, 4), 16),
         parseInt(clean.substring(4, 6), 16)
       ];
+      _rgbCache[hex] = cached;
+      return cached;
     }
 
     function lerpColor(hexA, hexB, t) {
@@ -2175,6 +2419,24 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       const bl = Math.round(a[2] + (b[2] - a[2]) * t);
       return "rgb(" + r + "," + g + "," + bl + ")";
     }
+
+    const SPHERE_SHADES = {
+      ELIGIBLE: {
+        base: PALETTE.emerald,
+        spec: lerpColor(PALETTE.emerald, "#FFFFFF", 0.62),
+        rim: lerpColor(PALETTE.emerald, "#0D0E11", 0.42)
+      },
+      POTENTIAL_NEEDS_LABS: {
+        base: PALETTE.amber,
+        spec: lerpColor(PALETTE.amber, "#FFFFFF", 0.62),
+        rim: lerpColor(PALETTE.amber, "#0D0E11", 0.42)
+      },
+      INELIGIBLE: {
+        base: PALETTE.rose,
+        spec: lerpColor(PALETTE.rose, "#FFFFFF", 0.62),
+        rim: lerpColor(PALETTE.rose, "#0D0E11", 0.42)
+      }
+    };
 
     /* Smooth concentration gradient: surface -> #0D9488 -> #4F46E5 -> #E11D48 (DESIGN.md Section 5) */
     function heatmapColor(normVal, surfaceHex) {
@@ -2300,9 +2562,15 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       });
     }
 
+    const _alphaCache = Object.create(null);
     function hexAlpha(hex, alpha) {
+      const key = hex + "|" + alpha;
+      let cached = _alphaCache[key];
+      if (cached) return cached;
       const rgb = hexToRgb(hex);
-      return "rgba(" + rgb[0] + "," + rgb[1] + "," + rgb[2] + "," + alpha + ")";
+      cached = "rgba(" + rgb[0] + "," + rgb[1] + "," + rgb[2] + "," + alpha + ")";
+      _alphaCache[key] = cached;
+      return cached;
     }
 
     function drawRoundedRect(ctx, x, y, w, h, r) {
@@ -2355,6 +2623,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     }
 
     function computePortfolioWeeklyPeerAvg(len) {
+      if (INDEX.peerWeeklyAvg.length >= len) return INDEX.peerWeeklyAvg.slice(0, len);
       const sites = WORKSPACE.sites || [];
       if (!sites.length) return new Array(len).fill(2);
       const avg = [];
@@ -2381,7 +2650,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       const n = series.length;
       const peerSeries = computePortfolioWeeklyPeerAvg(n);
 
-      const siteObj = WORKSPACE.sites.find(function (s) { return s.site_id === sig.site_id; });
+      const siteObj = INDEX.sitesById[sig.site_id];
       const critShare = siteObj && siteObj.signal_counts.TOTAL > 0
         ? siteObj.signal_counts.CRITICAL / siteObj.signal_counts.TOTAL
         : (sig.severity === "CRITICAL" ? 0.45 : 0.0);
@@ -2714,93 +2983,88 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         ctx.fillText(al[1], al[0].sx, al[0].sy);
       });
 
-      /* Project All Filtered Candidate Patients */
-      const filteredPats = getFilteredPatients();
-      const pts = filteredPats.map(function (p) {
-        const L = p.labs || {};
-        const bioVal = Number(L.biomarker_composite_z != null ? L.biomarker_composite_z : 40);
-        const egfrVal = Number(L.egfr_ml_min != null ? L.egfr_ml_min : 48);
-        const sevVal = Number(p.severity_index != null ? p.severity_index : 50);
-        const bx = Math.max(-0.96, Math.min(0.96, (bioVal / 100) * 2 - 1));
-        const ey = Math.max(-0.96, Math.min(0.96, (Math.min(110, egfrVal) / 110) * 2 - 1));
-        const sz = Math.max(-0.96, Math.min(0.96, (sevVal / 100) * 2 - 1));
+      /* Project All Filtered Candidate Patients using Pre-Normalized 3D Coordinates */
+      const patMeta = getFilteredPatientsMeta();
+      const filteredPats = patMeta.list;
+      const pts = new Array(filteredPats.length);
+      for (let i = 0; i < filteredPats.length; i++) {
+        const p = filteredPats[i];
+        const norm = INDEX.patientNorm3d[p.patient_id];
+        const bx = norm.bx, ey = norm.ey, sz = norm.sz;
         const proj = project(bx, ey, sz);
         const floorProj = project(bx, -1, sz);
-        return {
+        pts[i] = {
           pat: p, bx: bx, ey: ey, sz: sz,
-          bioVal: bioVal, egfrVal: L.egfr_ml_min, sevVal: sevVal,
+          bioVal: norm.bioVal, egfrVal: norm.egfrVal, sevVal: norm.sevVal,
           sx: proj.sx, sy: proj.sy, fx: floorProj.sx, fy: floorProj.sy,
           depth: proj.depth, persp: proj.persp
         };
-      });
+      }
 
       /* Pass 1: Floor Elliptical Drop Shadows & Subtle Elevation Stems */
-      pts.forEach(function (item) {
+      const shadowFill = tk.dark ? "rgba(0,0,0,0.42)" : "rgba(28,25,23,0.13)";
+      const stemStroke = hexAlpha(PALETTE.emerald, tk.dark ? 0.18 : 0.15);
+      ctx.fillStyle = shadowFill;
+      ctx.strokeStyle = stemStroke;
+      ctx.lineWidth = 0.8;
+      for (let i = 0; i < pts.length; i++) {
+        const item = pts[i];
         const sr = Math.max(2.2, 4.2 * item.persp);
-        ctx.fillStyle = tk.dark ? "rgba(0,0,0,0.42)" : "rgba(28,25,23,0.13)";
         ctx.beginPath();
         ctx.ellipse(item.fx, item.fy, sr * 1.15, sr * 0.55, 0, 0, Math.PI * 2);
         ctx.fill();
 
         if (item.pat.primary_classification === "ELIGIBLE") {
-          ctx.strokeStyle = hexAlpha(PALETTE.emerald, tk.dark ? 0.18 : 0.15);
-          ctx.lineWidth = 0.8;
           ctx.beginPath(); ctx.moveTo(item.fx, item.fy); ctx.lineTo(item.sx, item.sy); ctx.stroke();
         }
-      });
+      }
 
       /* Pass 2: Depth-Sorted 3D Shaded Spheres */
       pts.sort(function (a, b) { return b.depth - a.depth; });
       STATE.projected3dPoints = pts;
 
+      const defaultRimStroke = hexAlpha("#0D0E11", 0.28);
       let focusItem = null;
-      pts.forEach(function (item) {
+      for (let i = 0; i < pts.length; i++) {
+        const item = pts[i];
         const p = item.pat;
         const isSelected = p.patient_id === STATE.selectedPatientId;
         const isHovered = p.patient_id === STATE.hovered3dId;
         if (isHovered) focusItem = item;
         else if (isSelected && !focusItem) focusItem = item;
 
-        const baseHex = p.primary_classification === "ELIGIBLE"
-          ? PALETTE.emerald
-          : (p.primary_classification === "POTENTIAL_NEEDS_LABS" ? PALETTE.amber : PALETTE.rose);
-
+        const shade = SPHERE_SHADES[p.primary_classification] || SPHERE_SHADES.INELIGIBLE;
         const r = (isSelected || isHovered ? 7.2 : (p.primary_classification === "ELIGIBLE" ? 4.8 : 4.0)) * item.persp;
-        const specHex = lerpColor(baseHex, "#FFFFFF", 0.62);
-        const rimHex = lerpColor(baseHex, "#0D0E11", 0.42);
         const sphereGrad = ctx.createRadialGradient(
           item.sx - r * 0.32, item.sy - r * 0.32, r * 0.12,
           item.sx, item.sy, r
         );
-        sphereGrad.addColorStop(0, specHex);
-        sphereGrad.addColorStop(0.58, baseHex);
-        sphereGrad.addColorStop(1, rimHex);
+        sphereGrad.addColorStop(0, shade.spec);
+        sphereGrad.addColorStop(0.58, shade.base);
+        sphereGrad.addColorStop(1, shade.rim);
 
         ctx.fillStyle = sphereGrad;
         ctx.beginPath();
         ctx.arc(item.sx, item.sy, r, 0, Math.PI * 2);
         ctx.fill();
 
-        ctx.strokeStyle = (isSelected || isHovered) ? tk.text : hexAlpha("#0D0E11", 0.28);
+        ctx.strokeStyle = (isSelected || isHovered) ? tk.text : defaultRimStroke;
         ctx.lineWidth = (isSelected || isHovered) ? 1.8 : 0.7;
         ctx.stroke();
-      });
+      }
 
       /* Pass 3: Front Wireframe Silhouette Edges for Full 3D Volumetric Framing */
       const frontFaces = cubeFaces.slice(3);
-      ctx.strokeStyle = hexAlpha(tk.border, 0.55);
-      ctx.lineWidth = 0.9;
+      const frontEdgeStroke = hexAlpha(tk.border, 0.45);
       frontFaces.forEach(function (face) {
         const pc = face.corners.map(function (c) { return project(c[0], c[1], c[2]); });
-        drawQuad(pc[0], pc[1], pc[2], pc[3], null, hexAlpha(tk.border, 0.45), 0.8);
+        drawQuad(pc[0], pc[1], pc[2], pc[3], null, frontEdgeStroke, 0.8);
       });
 
       /* Pass 4: Tri-Planar Laser Crosshairs & Callout Badge on Active Patient */
       if (focusItem) {
         const fp = focusItem.pat;
-        const focusCol = fp.primary_classification === "ELIGIBLE"
-          ? PALETTE.emerald
-          : (fp.primary_classification === "POTENTIAL_NEEDS_LABS" ? PALETTE.amber : PALETTE.rose);
+        const focusCol = (SPHERE_SHADES[fp.primary_classification] || SPHERE_SHADES.INELIGIBLE).base;
         const wallX = project(backX, focusItem.ey, focusItem.sz);
         const wallZ = project(focusItem.bx, focusItem.ey, backZ);
 
@@ -2846,15 +3110,13 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       }
 
       /* Pass 5: Top-Left Scientific Telemetry Overlay */
-      const eligN = filteredPats.filter(function (p) { return p.primary_classification === "ELIGIBLE"; }).length;
-      const labsN = filteredPats.filter(function (p) { return p.primary_classification === "POTENTIAL_NEEDS_LABS"; }).length;
       const yawDeg = Math.round(((STATE.rot3dYaw * 180) / Math.PI) % 360);
       const pitchDeg = Math.round((STATE.rot3dPitch * 180) / Math.PI);
       ctx.font = '500 10px "IBM Plex Mono", monospace';
       ctx.fillStyle = tk.muted;
       ctx.textAlign = "left";
       ctx.fillText(
-        "COHORT: " + filteredPats.length + " (ELIG " + eligN + " / LABS " + labsN + ")  |  CAM " + yawDeg + "deg / " + pitchDeg + "deg  |  " + STATE.zoom3d.toFixed(2) + "x",
+        "COHORT: " + filteredPats.length + " (ELIG " + patMeta.eligCount + " / LABS " + patMeta.labsCount + ")  |  CAM " + yawDeg + "deg / " + pitchDeg + "deg  |  " + STATE.zoom3d.toFixed(2) + "x",
         10,
         15
       );
@@ -2874,6 +3136,223 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       ctx.closePath();
     }
 
+    function getNodeMapLayout() {
+      const patMeta = getFilteredPatientsMeta();
+      const layoutKey = INDEX.generation + "|" + STATE.nodeLayerMode + "|" + patMeta.key + "|" + STATE.selectedPatientId;
+      if (nodeLayoutCache.key === layoutKey && nodeLayoutCache.layout) {
+        return nodeLayoutCache.layout;
+      }
+
+      const nodes = [];
+      const edges = [];
+      const adj = Object.create(null);
+      const nodeIdxById = Object.create(null);
+      function linkAdj(a, b) {
+        if (!adj[a]) adj[a] = new Set();
+        if (!adj[b]) adj[b] = new Set();
+        adj[a].add(b);
+        adj[b].add(a);
+      }
+      function pushNode(nodeObj) {
+        nodeIdxById[nodeObj.id] = nodes.length;
+        nodes.push(nodeObj);
+      }
+
+      const siteMeta = Object.create(null);
+      const studies = WORKSPACE.studies || [];
+      let sigCnt = 0, patCnt = 0;
+
+      /* Tier 1: Study Protocol Core Hubs */
+      studies.forEach(function (st, sIdx) {
+        const ang = (sIdx / studies.length) * Math.PI * 2 - Math.PI * 0.75;
+        const stSites = INDEX.sitesByStudy[st.study_id] || [];
+        let enrSum = 0;
+        for (let j = 0; j < stSites.length; j++) enrSum += stSites[j].enrolled_count;
+        const tgtSum = Math.max(1, st.target_enrollment);
+        const progress = Math.min(1, enrSum / tgtSum);
+
+        pushNode({
+          id: st.study_id,
+          label: st.protocol_code,
+          sublabel: Math.round(progress * 100) + "% enr",
+          kind: "STUDY",
+          cosA: Math.cos(ang),
+          sinA: Math.sin(ang),
+          baseRad: 64,
+          x: 0,
+          y: 0,
+          r: 13.5,
+          progress: progress,
+          color: PALETTE.indigo,
+          detail: st.protocol_code + " (" + st.study_id + ")\\nArea: " + st.therapeutic_area + " | " + st.phase +
+            "\\nEnrolled: " + enrSum + " / " + tgtSum + " (" + Math.round(progress * 100) + "%)"
+        });
+
+        /* Tier 2: Sector-Aligned Clinical Sites around Parent Study */
+        stSites.forEach(function (site, kIdx) {
+          const span = 0.92;
+          const offset = stSites.length > 1 ? ((kIdx / (stSites.length - 1)) - 0.5) * span : 0;
+          const sAng = ang + offset;
+          const sCol = site.priority_tier === "Priority Action Required"
+            ? PALETTE.rose
+            : (site.priority_tier === "Important Signals Next" ? PALETTE.amber : PALETTE.emerald);
+          const blocked = site.site_status !== "ACTIVE" || site.unresolved_excursion === 1;
+
+          siteMeta[site.site_id] = { ang: sAng, study_id: st.study_id, color: sCol };
+          pushNode({
+            id: site.site_id,
+            label: site.site_id,
+            sublabel: "R:" + site.risk_score,
+            kind: "SITE",
+            cosA: Math.cos(sAng),
+            sinA: Math.sin(sAng),
+            baseRad: 138,
+            x: 0,
+            y: 0,
+            r: 9.5,
+            risk_score: site.risk_score,
+            blocked: blocked,
+            color: sCol,
+            detail: site.site_id + " - " + site.site_name + " (" + site.country_code + ")" +
+              "\\nTier: " + site.priority_tier + " (Risk " + site.risk_score + "/100)" +
+              "\\nSignals: " + site.signal_counts.CRITICAL + " CRIT / " + site.signal_counts.TOTAL + " Total" +
+              "\\nStatus: " + site.site_status + (site.unresolved_excursion ? " [COLD-CHAIN EXCURSION]" : "")
+          });
+
+          edges.push({
+            from: st.study_id,
+            to: site.site_id,
+            fromIdx: nodeIdxById[st.study_id],
+            toIdx: nodeIdxById[site.site_id],
+            color: sCol,
+            width: site.priority_tier === "Priority Action Required" ? 1.9 : 1.3,
+            dashed: false,
+            curveBend: offset * 0.25
+          });
+          linkAdj(st.study_id, site.site_id);
+        });
+      });
+
+      /* Tier 3A: Priority Risk Signal Alert Satellites (Diamond Glyphs) */
+      if (STATE.nodeLayerMode === "all" || STATE.nodeLayerMode === "signals") {
+        const perSiteCap = STATE.nodeLayerMode === "signals" ? 3 : 2;
+        const countBySite = Object.create(null);
+        WORKSPACE.signals.forEach(function (sig) {
+          if (sig.disposition === "DISMISS") return;
+          if (STATE.nodeLayerMode === "all" && sig.severity !== "CRITICAL" && sig.severity !== "HIGH") return;
+          const sp = siteMeta[sig.site_id];
+          if (!sp) return;
+          const c = countBySite[sig.site_id] || 0;
+          if (c >= perSiteCap) return;
+          countBySite[sig.site_id] = c + 1;
+
+          const sigAng = sp.ang - 0.14 + c * 0.14;
+          const baseRad = (STATE.nodeLayerMode === "signals" ? 196 : 186) + (c % 2) * 10;
+          const sigCol = sig.severity === "CRITICAL" ? PALETTE.rose : PALETTE.amber;
+
+          pushNode({
+            id: sig.signal_id,
+            label: sig.signal_id,
+            kind: "SIGNAL",
+            cosA: Math.cos(sigAng),
+            sinA: Math.sin(sigAng),
+            baseRad: baseRad,
+            x: 0,
+            y: 0,
+            r: 5.6,
+            color: sigCol,
+            detail: sig.signal_id + " [" + sig.severity + "] " + sig.family +
+              "\\n" + sig.title + "\\nSite: " + sig.site_id + " | Click to Audit Evidence"
+          });
+          sigCnt++;
+          edges.push({
+            from: sig.site_id,
+            to: sig.signal_id,
+            fromIdx: nodeIdxById[sig.site_id],
+            toIdx: nodeIdxById[sig.signal_id],
+            color: sigCol,
+            width: 1.15,
+            dashed: true,
+            curveBend: -0.12
+          });
+          linkAdj(sig.site_id, sig.signal_id);
+          linkAdj(sp.study_id, sig.signal_id);
+        });
+      }
+
+      /* Tier 3B: Eligible & Lab-Refresh Candidate Patient Referral Nodes */
+      if (STATE.nodeLayerMode === "all" || STATE.nodeLayerMode === "referrals") {
+        const capTotal = STATE.nodeLayerMode === "referrals" ? 48 : 30;
+        const candidates = patMeta.list.filter(function (p) {
+          return (p.primary_classification === "ELIGIBLE" ||
+            (STATE.nodeLayerMode === "referrals" && p.primary_classification === "POTENTIAL_NEEDS_LABS")) &&
+            p.recommended_site_id;
+        });
+
+        /* Ensure currently selected patient is included if eligible/routed */
+        const chosen = candidates.slice(0, capTotal);
+        const selP = candidates.find(function (p) { return p.patient_id === STATE.selectedPatientId; });
+        if (selP && chosen.length > 0 && !chosen.some(function (x) { return x.patient_id === selP.patient_id; })) {
+          chosen[chosen.length - 1] = selP;
+        }
+
+        const patCountBySite = Object.create(null);
+        chosen.forEach(function (p) {
+          const sp = siteMeta[p.recommended_site_id];
+          if (!sp) return;
+          const idxAtSite = patCountBySite[p.recommended_site_id] || 0;
+          patCountBySite[p.recommended_site_id] = idxAtSite + 1;
+
+          const spread = ((idxAtSite % 5) - 2) * 0.085;
+          const ringStep = Math.floor(idxAtSite / 5) * 13;
+          const pAng = sp.ang + 0.05 + spread;
+          const pCol = p.primary_classification === "ELIGIBLE" ? PALETTE.teal : PALETTE.amber;
+
+          pushNode({
+            id: p.patient_id,
+            label: p.patient_id,
+            kind: "PATIENT",
+            cosA: Math.cos(pAng),
+            sinA: Math.sin(pAng),
+            baseRad: 204 + ringStep,
+            x: 0,
+            y: 0,
+            r: p.patient_id === STATE.selectedPatientId ? 6.5 : 4.6,
+            color: pCol,
+            detail: p.patient_id + " (" + p.primary_classification + " - " + p.primary_match_score + "pt)" +
+              "\\nICD-10: " + p.primary_icd10 + " | Age " + p.age_years + "/" + p.sex +
+              "\\nRouted Site: " + p.recommended_site_id + " (" + p.primary_match_protocol + ")"
+          });
+          patCnt++;
+          edges.push({
+            from: p.recommended_site_id,
+            to: p.patient_id,
+            fromIdx: nodeIdxById[p.recommended_site_id],
+            toIdx: nodeIdxById[p.patient_id],
+            color: pCol,
+            width: 1.15,
+            dashed: false,
+            arrow: true,
+            curveBend: 0.14
+          });
+          linkAdj(p.recommended_site_id, p.patient_id);
+          linkAdj(sp.study_id, p.patient_id);
+        });
+      }
+
+      const layout = {
+        nodes: nodes,
+        edges: edges,
+        adj: adj,
+        studyCount: studies.length,
+        siteCount: (WORKSPACE.sites || []).length,
+        sigCnt: sigCnt,
+        patCnt: patCnt
+      };
+      nodeLayoutCache = { key: layoutKey, layout: layout };
+      return layout;
+    }
+
     function drawNodeMapPlot() {
       const stage = setupPlotSurface("canvas-nodemap");
       if (!stage) return;
@@ -2886,7 +3365,6 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 
       const rStudy = 64 * z;
       const rSite = 138 * z;
-      const rSig = 186 * z;
       const rPat = 204 * z;
 
       /* Subtle Concentric Orbital Telemetry Guides */
@@ -2901,208 +3379,35 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       });
       ctx.restore();
 
-      const nodes = [];
-      const edges = [];
-      const adj = {};
-      function linkAdj(a, b) {
-        if (!adj[a]) adj[a] = new Set();
-        if (!adj[b]) adj[b] = new Set();
-        adj[a].add(b);
-        adj[b].add(a);
-      }
+      const layout = getNodeMapLayout();
+      const nodes = layout.nodes;
+      const edges = layout.edges;
+      const adj = layout.adj;
 
-      const studyPos = {};
-      const sitePos = {};
-      const sitesByStudy = {};
-      WORKSPACE.sites.forEach(function (s) {
-        if (!sitesByStudy[s.study_id]) sitesByStudy[s.study_id] = [];
-        sitesByStudy[s.study_id].push(s);
-      });
-
-      /* Tier 1: Study Protocol Core Hubs (Quadrant Layout with Enrollment Progress Arcs) */
-      WORKSPACE.studies.forEach(function (st, sIdx) {
-        const ang = (sIdx / WORKSPACE.studies.length) * Math.PI * 2 - Math.PI * 0.75;
-        const x = cx + Math.cos(ang) * rStudy;
-        const y = cy + Math.sin(ang) * rStudy;
-        const stSites = sitesByStudy[st.study_id] || [];
-        const enrSum = stSites.reduce(function (acc, s) { return acc + s.enrolled_count; }, 0);
-        const tgtSum = Math.max(1, st.target_enrollment);
-        const progress = Math.min(1, enrSum / tgtSum);
-
-        studyPos[st.study_id] = { x: x, y: y, ang: ang, code: st.protocol_code };
-        nodes.push({
-          id: st.study_id,
-          label: st.protocol_code,
-          sublabel: Math.round(progress * 100) + "% enr",
-          kind: "STUDY",
-          x: x,
-          y: y,
-          r: 13.5,
-          progress: progress,
-          color: PALETTE.indigo,
-          detail: st.protocol_code + " (" + st.study_id + ")\\nArea: " + st.therapeutic_area + " | " + st.phase +
-            "\\nEnrolled: " + enrSum + " / " + tgtSum + " (" + Math.round(progress * 100) + "%)"
-        });
-
-        /* Tier 2: Sector-Aligned Clinical Sites around Parent Study */
-        stSites.forEach(function (site, kIdx) {
-          const span = 0.92;
-          const offset = stSites.length > 1 ? ((kIdx / (stSites.length - 1)) - 0.5) * span : 0;
-          const sAng = ang + offset;
-          const sx = cx + Math.cos(sAng) * rSite;
-          const sy = cy + Math.sin(sAng) * rSite;
-          const sCol = site.priority_tier === "Priority Action Required"
-            ? PALETTE.rose
-            : (site.priority_tier === "Important Signals Next" ? PALETTE.amber : PALETTE.emerald);
-          const blocked = site.site_status !== "ACTIVE" || site.unresolved_excursion === 1;
-
-          sitePos[site.site_id] = { x: sx, y: sy, ang: sAng, study_id: st.study_id, color: sCol };
-          nodes.push({
-            id: site.site_id,
-            label: site.site_id,
-            sublabel: "R:" + site.risk_score,
-            kind: "SITE",
-            x: sx,
-            y: sy,
-            r: 9.5,
-            risk_score: site.risk_score,
-            blocked: blocked,
-            color: sCol,
-            detail: site.site_id + " - " + site.site_name + " (" + site.country_code + ")" +
-              "\\nTier: " + site.priority_tier + " (Risk " + site.risk_score + "/100)" +
-              "\\nSignals: " + site.signal_counts.CRITICAL + " CRIT / " + site.signal_counts.TOTAL + " Total" +
-              "\\nStatus: " + site.site_status + (site.unresolved_excursion ? " [COLD-CHAIN EXCURSION]" : "")
-          });
-
-          edges.push({
-            from: st.study_id,
-            to: site.site_id,
-            x1: x, y1: y, x2: sx, y2: sy,
-            color: sCol,
-            width: site.priority_tier === "Priority Action Required" ? 1.9 : 1.3,
-            dashed: false,
-            curveBend: offset * 0.25
-          });
-          linkAdj(st.study_id, site.site_id);
-        });
-      });
-
-      /* Tier 3A: Priority Risk Signal Alert Satellites (Diamond Glyphs) */
-      if (STATE.nodeLayerMode === "all" || STATE.nodeLayerMode === "signals") {
-        const perSiteCap = STATE.nodeLayerMode === "signals" ? 3 : 2;
-        const countBySite = {};
-        WORKSPACE.signals.forEach(function (sig) {
-          if (sig.disposition === "DISMISS") return;
-          if (STATE.nodeLayerMode === "all" && sig.severity !== "CRITICAL" && sig.severity !== "HIGH") return;
-          const sp = sitePos[sig.site_id];
-          if (!sp) return;
-          const c = countBySite[sig.site_id] || 0;
-          if (c >= perSiteCap) return;
-          countBySite[sig.site_id] = c + 1;
-
-          const sigAng = sp.ang - 0.14 + c * 0.14;
-          const rad = (STATE.nodeLayerMode === "signals" ? rPat - 8 * z : rSig) + (c % 2) * 10 * z;
-          const gx = cx + Math.cos(sigAng) * rad;
-          const gy = cy + Math.sin(sigAng) * rad;
-          const sigCol = sig.severity === "CRITICAL" ? PALETTE.rose : PALETTE.amber;
-
-          nodes.push({
-            id: sig.signal_id,
-            label: sig.signal_id,
-            kind: "SIGNAL",
-            x: gx,
-            y: gy,
-            r: 5.6,
-            color: sigCol,
-            detail: sig.signal_id + " [" + sig.severity + "] " + sig.family +
-              "\\n" + sig.title + "\\nSite: " + sig.site_id + " | Click to Audit Evidence"
-          });
-          edges.push({
-            from: sig.site_id,
-            to: sig.signal_id,
-            x1: sp.x, y1: sp.y, x2: gx, y2: gy,
-            color: sigCol,
-            width: 1.15,
-            dashed: true,
-            curveBend: -0.12
-          });
-          linkAdj(sig.site_id, sig.signal_id);
-          linkAdj(sp.study_id, sig.signal_id);
-        });
-      }
-
-      /* Tier 3B: Eligible & Lab-Refresh Candidate Patient Referral Nodes */
-      if (STATE.nodeLayerMode === "all" || STATE.nodeLayerMode === "referrals") {
-        const capTotal = STATE.nodeLayerMode === "referrals" ? 48 : 30;
-        const candidates = getFilteredPatients().filter(function (p) {
-          return (p.primary_classification === "ELIGIBLE" ||
-            (STATE.nodeLayerMode === "referrals" && p.primary_classification === "POTENTIAL_NEEDS_LABS")) &&
-            p.recommended_site_id;
-        });
-
-        /* Ensure currently selected patient is included if eligible/routed */
-        const chosen = candidates.slice(0, capTotal);
-        const selP = candidates.find(function (p) { return p.patient_id === STATE.selectedPatientId; });
-        if (selP && !chosen.some(function (x) { return x.patient_id === selP.patient_id; })) {
-          chosen[chosen.length - 1] = selP;
-        }
-
-        const patCountBySite = {};
-        chosen.forEach(function (p) {
-          const sp = sitePos[p.recommended_site_id];
-          if (!sp) return;
-          const idxAtSite = patCountBySite[p.recommended_site_id] || 0;
-          patCountBySite[p.recommended_site_id] = idxAtSite + 1;
-
-          const spread = ((idxAtSite % 5) - 2) * 0.085;
-          const ringStep = Math.floor(idxAtSite / 5) * 13 * z;
-          const pAng = sp.ang + 0.05 + spread;
-          const px = cx + Math.cos(pAng) * (rPat + ringStep);
-          const py = cy + Math.sin(pAng) * (rPat + ringStep);
-          const pCol = p.primary_classification === "ELIGIBLE" ? PALETTE.teal : PALETTE.amber;
-
-          nodes.push({
-            id: p.patient_id,
-            label: p.patient_id,
-            kind: "PATIENT",
-            x: px,
-            y: py,
-            r: p.patient_id === STATE.selectedPatientId ? 6.5 : 4.6,
-            color: pCol,
-            detail: p.patient_id + " (" + p.primary_classification + " - " + p.primary_match_score + "pt)" +
-              "\\nICD-10: " + p.primary_icd10 + " | Age " + p.age_years + "/" + p.sex +
-              "\\nRouted Site: " + p.recommended_site_id + " (" + p.primary_match_protocol + ")"
-          });
-          edges.push({
-            from: p.recommended_site_id,
-            to: p.patient_id,
-            x1: sp.x, y1: sp.y, x2: px, y2: py,
-            color: pCol,
-            width: 1.15,
-            dashed: false,
-            arrow: true,
-            curveBend: 0.14
-          });
-          linkAdj(p.recommended_site_id, p.patient_id);
-          linkAdj(sp.study_id, p.patient_id);
-        });
+      /* Project cached polar coordinates to viewport screen coordinates */
+      for (let i = 0; i < nodes.length; i++) {
+        const n = nodes[i];
+        const rad = n.baseRad * z;
+        n.x = cx + n.cosA * rad;
+        n.y = cy + n.sinA * rad;
       }
 
       /* Determine Active Spotlight Set (Hovered Node + Connected Neighborhood) */
       const spotlightId = STATE.hoveredNodeId;
-      const hasSpotlight = Boolean(spotlightId && adj[spotlightId]);
-      function isNodeLit(id) {
-        if (!hasSpotlight) return true;
-        return id === spotlightId || adj[spotlightId].has(id);
-      }
+      const spotlightSet = spotlightId ? adj[spotlightId] : null;
+      const hasSpotlight = Boolean(spotlightSet);
 
       /* Render Curved Quadratic Bezier Edges & Mid-Curve Flow Chevrons */
-      edges.forEach(function (e) {
+      for (let i = 0; i < edges.length; i++) {
+        const e = edges[i];
+        const n1 = nodes[e.fromIdx];
+        const n2 = nodes[e.toIdx];
+        const x1 = n1.x, y1 = n1.y, x2 = n2.x, y2 = n2.y;
         const edgeLit = !hasSpotlight || e.from === spotlightId || e.to === spotlightId ||
-          (adj[spotlightId].has(e.from) && adj[spotlightId].has(e.to));
-        const mx = (e.x1 + e.x2) * 0.5;
-        const my = (e.y1 + e.y2) * 0.5;
-        const dx = e.x2 - e.x1, dy = e.y2 - e.y1;
+          (spotlightSet.has(e.from) && spotlightSet.has(e.to));
+        const mx = (x1 + x2) * 0.5;
+        const my = (y1 + y2) * 0.5;
+        const dx = x2 - x1, dy = y2 - y1;
         const cpx = mx - dy * (e.curveBend || 0.1);
         const cpy = my + dx * (e.curveBend || 0.1);
 
@@ -3111,17 +3416,17 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         ctx.lineWidth = edgeLit && hasSpotlight ? e.width + 0.8 : e.width;
         if (e.dashed) ctx.setLineDash([3, 3]);
         ctx.beginPath();
-        ctx.moveTo(e.x1, e.y1);
-        ctx.quadraticCurveTo(cpx, cpy, e.x2, e.y2);
+        ctx.moveTo(x1, y1);
+        ctx.quadraticCurveTo(cpx, cpy, x2, y2);
         ctx.stroke();
 
         /* Directional Chevron at t = 0.58 on Referral Edges */
         if (e.arrow && edgeLit) {
           const t = 0.58;
-          const qx = (1 - t) * (1 - t) * e.x1 + 2 * (1 - t) * t * cpx + t * t * e.x2;
-          const qy = (1 - t) * (1 - t) * e.y1 + 2 * (1 - t) * t * cpy + t * t * e.y2;
-          const tx = 2 * (1 - t) * (cpx - e.x1) + 2 * t * (e.x2 - cpx);
-          const ty = 2 * (1 - t) * (cpy - e.y1) + 2 * t * (e.y2 - cpy);
+          const qx = (1 - t) * (1 - t) * x1 + 2 * (1 - t) * t * cpx + t * t * x2;
+          const qy = (1 - t) * (1 - t) * y1 + 2 * (1 - t) * t * cpy + t * t * y2;
+          const tx = 2 * (1 - t) * (cpx - x1) + 2 * t * (x2 - cpx);
+          const ty = 2 * (1 - t) * (cpy - y1) + 2 * t * (y2 - cpy);
           const tang = Math.atan2(ty, tx);
           ctx.setLineDash([]);
           ctx.fillStyle = hexAlpha(e.color, hasSpotlight ? 0.95 : 0.70);
@@ -3133,11 +3438,12 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
           ctx.fill();
         }
         ctx.restore();
-      });
+      }
 
       /* Render Procedural Multi-Layer Node Glyphs */
-      nodes.forEach(function (n) {
-        const lit = isNodeLit(n.id);
+      for (let i = 0; i < nodes.length; i++) {
+        const n = nodes[i];
+        const lit = !hasSpotlight || n.id === spotlightId || spotlightSet.has(n.id);
         const isFocus = n.id === spotlightId || n.id === STATE.selectedPatientId;
         ctx.save();
         ctx.globalAlpha = lit ? 1.0 : 0.22;
@@ -3219,16 +3525,14 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
           }
         }
         ctx.restore();
-      });
+      }
 
       /* Bottom-Left Network Summary HUD */
-      const sigCnt = nodes.filter(function (n) { return n.kind === "SIGNAL"; }).length;
-      const patCnt = nodes.filter(function (n) { return n.kind === "PATIENT"; }).length;
       ctx.font = '500 10px "IBM Plex Mono", monospace';
       ctx.fillStyle = tk.muted;
       ctx.textAlign = "left";
       ctx.fillText(
-        "NODES: 4 PROTOCOLS | 16 SITES | " + sigCnt + " SIGNALS | " + patCnt + " REFERRALS   (SCROLL ZOOM / CLICK NODE)",
+        "NODES: " + layout.studyCount + " PROTOCOLS | " + layout.siteCount + " SITES | " + layout.sigCnt + " SIGNALS | " + layout.patCnt + " REFERRALS   (SCROLL ZOOM / CLICK NODE)",
         10,
         h - 10
       );
@@ -3299,7 +3603,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         drawHeatmapPlot();
         drawSaeTrendPlot();
       } else if (STATE.activeView === "signal") {
-        const sig = WORKSPACE.signals.find(function (s) { return s.signal_id === STATE.selectedSignalId; });
+        const sig = INDEX.signalsById[STATE.selectedSignalId];
         drawSiteTrendPlot(sig);
       } else if (STATE.activeView === "selection") {
         draw3DBiomarkerPlot();
@@ -3307,6 +3611,33 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       } else if (STATE.activeView === "analytics") {
         drawAnalyticsPlot(STATE.activeAnalyticsResult);
       }
+    }
+
+    let raf3dId = null;
+    function schedule3dDraw() {
+      if (raf3dId !== null) return;
+      raf3dId = window.requestAnimationFrame(function () {
+        raf3dId = null;
+        draw3DBiomarkerPlot();
+      });
+    }
+
+    let rafNodeId = null;
+    function scheduleNodeMapDraw() {
+      if (rafNodeId !== null) return;
+      rafNodeId = window.requestAnimationFrame(function () {
+        rafNodeId = null;
+        drawNodeMapPlot();
+      });
+    }
+
+    let rafResizeId = null;
+    function scheduleResizeRedraw() {
+      if (rafResizeId !== null) return;
+      rafResizeId = window.requestAnimationFrame(function () {
+        rafResizeId = null;
+        redrawAllPlots();
+      });
     }
 
     function renderActiveView() {
@@ -3372,8 +3703,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         cTrend.style.cursor = "crosshair";
         if (STATE.hoveredTrendIdx !== best.idx) {
           STATE.hoveredTrendIdx = best.idx;
-          const sig = WORKSPACE.signals.find(function (s) { return s.signal_id === STATE.selectedSignalId; });
-          drawSiteTrendPlot(sig);
+          drawSiteTrendPlot(INDEX.signalsById[STATE.selectedSignalId]);
         }
         const diff = (best.val - best.peer).toFixed(1);
         showTip(
@@ -3390,8 +3720,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     cTrend.addEventListener("mouseleave", function () {
       STATE.hoveredTrendIdx = -1;
       hideTip();
-      const sig = WORKSPACE.signals.find(function (s) { return s.signal_id === STATE.selectedSignalId; });
-      drawSiteTrendPlot(sig);
+      drawSiteTrendPlot(INDEX.signalsById[STATE.selectedSignalId]);
     });
 
     /* 3D Biomarker Cube Orbit, Zoom, Presets, Auto-Orbit & Hover */
@@ -3407,7 +3736,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 
     function stepAutoOrbit() {
       if (!STATE.autoOrbit3d) { orbitAnimId = null; return; }
-      if (STATE.activeView === "selection" && !drag3d) {
+      if (STATE.activeView === "selection" && !drag3d && !document.hidden) {
         STATE.rot3dYaw += 0.0045;
         draw3DBiomarkerPlot();
       }
@@ -3425,14 +3754,14 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       STATE.rot3dYaw += dx * 0.01;
       STATE.rot3dPitch = Math.max(-1.25, Math.min(1.25, STATE.rot3dPitch + dy * 0.01));
       drag3d.x = ev.clientX; drag3d.y = ev.clientY;
-      draw3DBiomarkerPlot();
+      schedule3dDraw();
     });
     window.addEventListener("mouseup", function () { drag3d = null; });
 
     c3d.addEventListener("wheel", function (ev) {
       ev.preventDefault();
       STATE.zoom3d = Math.max(0.65, Math.min(2.15, STATE.zoom3d * (ev.deltaY < 0 ? 1.08 : 0.92)));
-      draw3DBiomarkerPlot();
+      schedule3dDraw();
     }, { passive: false });
 
     c3d.addEventListener("mousemove", function (ev) {
@@ -3440,14 +3769,16 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       const rect = c3d.getBoundingClientRect();
       const mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
       let hit = null, bestD = 11;
-      STATE.projected3dPoints.forEach(function (pt) {
+      const pts = STATE.projected3dPoints;
+      for (let i = 0; i < pts.length; i++) {
+        const pt = pts[i];
         const d = Math.hypot(pt.sx - mx, pt.sy - my);
         if (d <= bestD) { bestD = d; hit = pt; }
-      });
+      }
       const nextHov = hit ? hit.pat.patient_id : null;
       if (STATE.hovered3dId !== nextHov) {
         STATE.hovered3dId = nextHov;
-        draw3DBiomarkerPlot();
+        schedule3dDraw();
       }
       if (hit) {
         c3d.style.cursor = "pointer";
@@ -3467,7 +3798,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     c3d.addEventListener("mouseleave", function () {
       if (STATE.hovered3dId !== null) {
         STATE.hovered3dId = null;
-        draw3DBiomarkerPlot();
+        schedule3dDraw();
       }
       hideTip();
     });
@@ -3475,13 +3806,14 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       const rect = c3d.getBoundingClientRect();
       const mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
       let hit = null, bestD = 12;
-      STATE.projected3dPoints.forEach(function (pt) {
+      const pts = STATE.projected3dPoints;
+      for (let i = 0; i < pts.length; i++) {
+        const pt = pts[i];
         const d = Math.hypot(pt.sx - mx, pt.sy - my);
         if (d < bestD) { bestD = d; hit = pt; }
-      });
+      }
       if (hit) {
-        STATE.selectedPatientId = hit.pat.patient_id;
-        renderTrialSelection();
+        selectPatientInView(hit.pat.patient_id);
       }
     });
 
@@ -3526,13 +3858,13 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       STATE.nodePanX += dx;
       STATE.nodePanY += dy;
       dragNode.x = ev.clientX; dragNode.y = ev.clientY;
-      drawNodeMapPlot();
+      scheduleNodeMapDraw();
     });
     window.addEventListener("mouseup", function () { dragNode = null; });
     cNode.addEventListener("wheel", function (ev) {
       ev.preventDefault();
       STATE.nodeZoom = Math.max(0.55, Math.min(2.4, STATE.nodeZoom * (ev.deltaY < 0 ? 1.10 : 0.91)));
-      drawNodeMapPlot();
+      scheduleNodeMapDraw();
     }, { passive: false });
 
     cNode.addEventListener("mousemove", function (ev) {
@@ -3540,14 +3872,16 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       const rect = cNode.getBoundingClientRect();
       const mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
       let hit = null, bestD = 999;
-      STATE.renderedNodes.forEach(function (n) {
+      const nodes = STATE.renderedNodes;
+      for (let i = 0; i < nodes.length; i++) {
+        const n = nodes[i];
         const d = Math.hypot(n.x - mx, n.y - my);
         if (d <= n.r + 5 && d < bestD) { bestD = d; hit = n; }
-      });
+      }
       const nextId = hit ? hit.id : null;
       if (STATE.hoveredNodeId !== nextId) {
         STATE.hoveredNodeId = nextId;
-        drawNodeMapPlot();
+        scheduleNodeMapDraw();
       }
       if (hit) {
         cNode.style.cursor = "pointer";
@@ -3560,7 +3894,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     cNode.addEventListener("mouseleave", function () {
       if (STATE.hoveredNodeId !== null) {
         STATE.hoveredNodeId = null;
-        drawNodeMapPlot();
+        scheduleNodeMapDraw();
       }
       hideTip();
     });
@@ -3572,8 +3906,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       });
       if (!hit) return;
       if (hit.kind === "PATIENT") {
-        STATE.selectedPatientId = hit.id;
-        renderTrialSelection();
+        selectPatientInView(hit.id);
       } else if (hit.kind === "SITE") {
         STATE.selectedSiteId = hit.id;
         switchView("site");
@@ -3591,6 +3924,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     document.querySelectorAll("[data-nodelayer]").forEach(function (btn) {
       btn.addEventListener("click", function () {
         STATE.nodeLayerMode = btn.getAttribute("data-nodelayer");
+        invalidateNodeLayoutCache();
         document.querySelectorAll("[data-nodelayer]").forEach(function (b) {
           const isAct = b === btn;
           b.classList.toggle("active", isAct);
@@ -3682,11 +4016,13 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     });
     document.getElementById("btn-generate-agenda").addEventListener("click", function () {
       STATE.siteDraftMode = "agenda";
-      renderSingleSite();
+      const site = getSelectedSite();
+      if (site) document.getElementById("site-draft-output").textContent = compileSiteDraft(site, "agenda");
     });
     document.getElementById("btn-generate-email").addEventListener("click", function () {
       STATE.siteDraftMode = "email";
-      renderSingleSite();
+      const site = getSelectedSite();
+      if (site) document.getElementById("site-draft-output").textContent = compileSiteDraft(site, "email");
     });
     document.getElementById("btn-copy-site-draft").addEventListener("click", function () {
       navigator.clipboard && navigator.clipboard.writeText(document.getElementById("site-draft-output").textContent);
@@ -3697,7 +4033,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       renderSignalDetail();
     });
     document.getElementById("btn-back-to-site").addEventListener("click", function () {
-      const sig = WORKSPACE.signals.find(function (s) { return s.signal_id === STATE.selectedSignalId; });
+      const sig = INDEX.signalsById[STATE.selectedSignalId];
       if (sig) { STATE.selectedSiteId = sig.site_id; switchView("site"); }
     });
     document.getElementById("btn-feedback-accept").addEventListener("click", function () { submitFeedback("ACCEPT"); });
@@ -3762,11 +4098,12 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         sig.disposition = serverFb ? serverFb.disposition : "PENDING_REVIEW";
         sig.reviewer_note = serverFb ? (serverFb.note || "") : "";
       });
+      invalidateNodeLayoutCache();
       applyThemeMode("system");
       renderActiveView();
     });
 
-    window.addEventListener("resize", redrawAllPlots);
+    window.addEventListener("resize", scheduleResizeRedraw);
 
     /* --- OPTIONAL LIVE SSE STREAMING (DESIGN.md Section 2) --- */
     if (window.location.protocol.startsWith("http") && typeof EventSource !== "undefined") {
@@ -3785,6 +4122,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
             }
             WORKSPACE = updated;
             syncLocalFeedback();
+            rebuildWorkspaceIndices();
             renderActiveView();
           } catch (parseErr) {}
         });
@@ -3815,13 +4153,32 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 """
 
 
-def _atomic_write_text(path: Path, content: str) -> None:
-    """Write text atomically via same-directory temporary file and os.replace."""
+_TEMPLATE_HEAD, _TEMPLATE_TAIL = DASHBOARD_HTML_TEMPLATE.split("__WORKSPACE_JSON_PAYLOAD__", 1)
+
+
+def serialize_bundle_json(bundle: dict[str, Any]) -> str:
+    """Serialize workspace bundle compactly with ASCII escaping (neutralizing U+2028/U+2029 in C)."""
+    return json.dumps(bundle, separators=(",", ":"), ensure_ascii=True)
+
+
+def _escape_inline_json(raw_json: str) -> str:
+    """Escape closing script tags and HTML comment markers safely for inline script embedding."""
+    escaped = raw_json.replace("</", "<\\/")
+    if "<!--" in escaped:
+        escaped = escaped.replace("<!--", "<\\!--")
+    return escaped
+
+
+def _atomic_write_chunks(path: Path, chunks: tuple[str, ...]) -> int:
+    """Stream text chunks atomically via same-directory temporary file and os.replace."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    total_chars = 0
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(content)
+            for chunk in chunks:
+                handle.write(chunk)
+                total_chars += len(chunk)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp_name, path)
@@ -3831,6 +4188,40 @@ def _atomic_write_text(path: Path, content: str) -> None:
         except OSError:
             pass
         raise
+    return total_chars
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Write text atomically via same-directory temporary file and os.replace."""
+    _atomic_write_chunks(path, (content,))
+
+
+def write_dashboard_from_bundle(
+    output_path: str | Path | None,
+    bundle: dict[str, Any],
+    raw_json: str | None = None,
+) -> tuple[dict[str, Any], str]:
+    """Emit standalone dashboard.html from an already-compiled bundle and return (summary, raw_json)."""
+    logger = configure_logging()
+    out = Path(output_path) if output_path else DEFAULT_DASHBOARD_PATH
+    if not out.is_absolute():
+        out = (PROJECT_ROOT / out).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    serialized = raw_json if raw_json is not None else serialize_bundle_json(bundle)
+    inline_json = _escape_inline_json(serialized)
+    size_bytes = _atomic_write_chunks(out, (_TEMPLATE_HEAD, inline_json, _TEMPLATE_TAIL))
+
+    logger.info("Emitted standalone dashboard to %s (%d bytes)", out, size_bytes)
+    summary = {
+        "dashboard_path": str(out),
+        "size_bytes": size_bytes,
+        "system_theme": bundle["metadata"]["system_theme"],
+        "sites_count": len(bundle["sites"]),
+        "signals_count": len(bundle["signals"]),
+        "patients_count": len(bundle["patient_selection"]["patients"]),
+    }
+    return summary, serialized
 
 
 def build_standalone_dashboard(
@@ -3840,32 +4231,8 @@ def build_standalone_dashboard(
     strict: bool = False,
 ) -> dict[str, Any]:
     """Compile workspace bundle and emit standalone dashboard.html."""
-    logger = configure_logging()
-    out = Path(output_path) if output_path else DEFAULT_DASHBOARD_PATH
-    if not out.is_absolute():
-        out = (PROJECT_ROOT / out).resolve()
-    out.parent.mkdir(parents=True, exist_ok=True)
-
     bundle = compile_workspace_bundle(
         data_dir=data_dir, state_file=state_file, strict=strict
     )
-    # Escape closing script tags, HTML comments, and JS line separators safely for inline embedding
-    json_payload = (
-        json.dumps(bundle, separators=(",", ":"))
-        .replace("</", "<\\/")
-        .replace("<!--", "<\\!--")
-        .replace("\u2028", "\\u2028")
-        .replace("\u2029", "\\u2029")
-    )
-    html_text = DASHBOARD_HTML_TEMPLATE.replace("__WORKSPACE_JSON_PAYLOAD__", json_payload)
-    _atomic_write_text(out, html_text)
-
-    logger.info("Emitted standalone dashboard to %s (%d bytes)", out, len(html_text))
-    return {
-        "dashboard_path": str(out),
-        "size_bytes": len(html_text),
-        "system_theme": bundle["metadata"]["system_theme"],
-        "sites_count": len(bundle["sites"]),
-        "signals_count": len(bundle["signals"]),
-        "patients_count": len(bundle["patient_selection"]["patients"]),
-    }
+    summary, _ = write_dashboard_from_bundle(output_path=output_path, bundle=bundle)
+    return summary
